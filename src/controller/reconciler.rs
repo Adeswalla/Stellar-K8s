@@ -946,9 +946,7 @@ pub(crate) async fn apply_stellar_node(
     .await?;
 
     if !ctx.dry_run {
-        let workload_exists_after = workload_resource_exists(client, node)
-            .await
-            .unwrap_or(true);
+        let workload_exists_after = workload_resource_exists(client, node).await.unwrap_or(true);
         if !workload_existed_before && workload_exists_after {
             let recorder = recorder_for(client, &ctx.event_reporter, node);
             if let Err(e) = publish_object_event(
@@ -1225,7 +1223,8 @@ pub(crate) async fn apply_stellar_node(
     }
 
     let prev_ready_reason = node.status.as_ref().and_then(|s| {
-        conditions::find_condition(&s.conditions, conditions::CONDITION_TYPE_READY).map(|c| c.reason.clone())
+        conditions::find_condition(&s.conditions, conditions::CONDITION_TYPE_READY)
+            .map(|c| c.reason.clone())
     });
     let sync_lag_begun = health_result.healthy
         && !health_result.synced
