@@ -47,7 +47,7 @@ jobs:
           fi
 
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+          echo "is`_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
 
   build-artifacts:
     name: Build ${{ matrix.target }}
