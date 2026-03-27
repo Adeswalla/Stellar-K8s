@@ -622,15 +622,7 @@ async fn run_webhook(args: WebhookArgs) -> Result<(), Error> {
         .with_default_directive(args.log_level.parse().unwrap_or(Level::INFO.into()))
         .from_env_lossy();
 
-    let fmt_layer = match args.log_format {
-        LogFormat::Json => fmt::layer()
-            .json()
-            .flatten_event(true)
-            .with_current_span(true)
-            .with_span_list(true)
-            .with_target(true),
-        LogFormat::Pretty => fmt::layer().with_target(true),
-    };
+    let fmt_layer = fmt::layer().json().with_target(true);
 
     let namespace = std::env::var("OPERATOR_NAMESPACE").unwrap_or_else(|_| "default".to_string());
 
