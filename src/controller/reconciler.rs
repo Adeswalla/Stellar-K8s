@@ -19,7 +19,7 @@
 //! 6. Update StellarNode status with current state
 //! 7. Schedule requeue for periodic health checks
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 

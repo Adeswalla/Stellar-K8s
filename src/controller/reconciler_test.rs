@@ -19,7 +19,7 @@ mod tests {
     use kube::api::ObjectMeta;
     use kube::runtime::controller::Action;
     use kube::Client;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Duration;
 
