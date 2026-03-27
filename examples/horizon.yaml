@@ -44,4 +44,5 @@ spec:
     tlsSecretName: "horizon-tls-secret"
 
   # Rollout strategy for updates. 'RollingUpdate' ensures minimal downtime.
-  strategy: RollingUpdate
+  strategy:
+    type: rollingUpdate

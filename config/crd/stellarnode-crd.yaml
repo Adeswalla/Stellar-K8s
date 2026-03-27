@@ -301,6 +301,9 @@ spec:
                     - meshType
                     type: object
                 type: object
+              customNetworkPassphrase:
+                nullable: true
+                type: string
               cveHandling:
                 description: CVE handling configuration for automated patching Enables scanning for vulnerabilities and automatic rollout of patched versions
                 nullable: true
@@ -874,7 +877,8 @@ spec:
                         type: string
                       nodeAffinity:
                         description: Node affinity for local storage mode (optional)
-                        nullable: true
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
                       retentionPolicy:
                         default: Delete
                         description: PVC retention policy on node deletion
@@ -894,16 +898,25 @@ spec:
                 - storage
                 type: object
               maxUnavailable:
-                nullable: true
-              minAvailable:
-                nullable: true
-              network:
                 anyOf:
-                - type: 'null'
-                - type: 'null'
-                - type: 'null'
+                - type: integer
                 - type: string
+                description: IntOrString
+                x-kubernetes-int-or-string: true
+              minAvailable:
+                anyOf:
+                - type: integer
+                - type: string
+                description: IntOrString
+                x-kubernetes-int-or-string: true
+              network:
                 description: Target Stellar network
+                enum:
+                - mainnet
+                - testnet
+                - futurenet
+                - custom
+                type: string
               networkPolicy:
                 description: Network Policy configuration
                 nullable: true
@@ -1288,7 +1301,8 @@ spec:
                     type: string
                   nodeAffinity:
                     description: Node affinity for local storage mode (optional)
-                    nullable: true
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
                   retentionPolicy:
                     default: Delete
                     description: PVC retention policy on node deletion
@@ -1305,26 +1319,39 @@ spec:
                 - storageClass
                 type: object
               strategy:
-                anyOf:
-                - type: 'null'
-                - {}
+                default:
+                  type: rollingUpdate
                 description: Rollout strategy for updates (RollingUpdate or Canary)
                 properties:
-                  checkIntervalSeconds:
-                    default: 300
-                    format: int32
-                    type: integer
-                  weight:
-                    default: 10
-                    format: int32
-                    type: integer
+                  canary:
+                    description: Configuration for Canary rollout
+                    nullable: true
+                    properties:
+                      checkIntervalSeconds:
+                        default: 300
+                        format: int32
+                        type: integer
+                      weight:
+                        default: 10
+                        format: int32
+                        type: integer
+                    type: object
+                  type:
+                    description: Rollout strategy type
+                    enum:
+                    - rollingUpdate
+                    - canary
+                    type: string
+                required:
+                - type
                 type: object
               suspended:
                 default: false
                 type: boolean
               topologySpreadConstraints:
-                items: {}
-                nullable: true
+                items:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
                 type: array
               validatorConfig:
                 description: Validator-specific configuration
@@ -1580,8 +1607,11 @@ spec:
                     type: string
                 type: object
             required:
+            - maxUnavailable
+            - minAvailable
             - network
             - nodeType
+            - topologySpreadConstraints
             - version
             type: object
           status:
