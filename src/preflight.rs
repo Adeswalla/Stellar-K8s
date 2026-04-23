@@ -67,15 +67,15 @@ struct GhLabel {
 /// This check is intentionally independent of Kubernetes connectivity so
 /// issue-automation failures are caught early and explained clearly.
 pub fn run_gh_label_preflight(repo: Option<&str>) -> Result<()> {
+    let Some(repo) = repo.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(());
+    };
+
     let deadline = Instant::now() + GH_PREFLIGHT_TIMEOUT;
 
     check_gh_auth(deadline)?;
 
-    if let Some(repo) = repo {
-        if !repo.trim().is_empty() {
-            ensure_required_labels(repo.trim(), REQUIRED_GH_LABELS, deadline)?;
-        }
-    }
+    ensure_required_labels(repo, REQUIRED_GH_LABELS, deadline)?;
 
     Ok(())
 }
@@ -94,7 +94,8 @@ fn check_gh_auth(deadline: Instant) -> Result<()> {
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::ConfigError(
-                    "GitHub CLI ('gh') was not found in PATH. Install from https://cli.github.com/".to_string(),
+                    "GitHub CLI ('gh') was not found in PATH. Install from https://cli.github.com/"
+                        .to_string(),
                 )
             } else {
                 Error::ConfigError(format!("failed to run `gh auth status`: {e}"))
@@ -138,7 +139,9 @@ fn ensure_required_labels(repo: &str, required: &[&str], deadline: Instant) -> R
     }
 
     let output = Command::new("gh")
-        .args(["label", "list", "--repo", repo, "--json", "name", "--limit", "200"])
+        .args([
+            "label", "list", "--repo", repo, "--json", "name", "--limit", "200",
+        ])
         .output()
         .map_err(|e| Error::ConfigError(format!("failed to run `gh label list`: {e}")))?;
 
@@ -171,16 +174,12 @@ fn ensure_required_labels(repo: &str, required: &[&str], deadline: Instant) -> R
 
         let status = Command::new("gh")
             .args([
-                "label",
-                "create",
-                label,
-                "--repo",
-                repo,
-                "--color",
-                "ededed",
+                "label", "create", label, "--repo", repo, "--color", "ededed",
             ])
             .status()
-            .map_err(|e| Error::ConfigError(format!("failed to run `gh label create {label}`: {e}")))?;
+            .map_err(|e| {
+                Error::ConfigError(format!("failed to run `gh label create {label}`: {e}"))
+            })?;
 
         if !status.success() {
             unresolved.push(label.to_string());
@@ -200,7 +199,11 @@ fn ensure_required_labels(repo: &str, required: &[&str], deadline: Instant) -> R
 fn parse_label_names(json_bytes: &[u8]) -> Result<Vec<String>> {
     let parsed: Vec<GhLabel> = serde_json::from_slice(json_bytes)
         .map_err(|e| Error::ConfigError(format!("failed to parse label JSON: {e}")))?;
-    Ok(parsed.into_iter().map(|l| l.name).filter(|n| !n.is_empty()).collect())
+    Ok(parsed
+        .into_iter()
+        .map(|l| l.name)
+        .filter(|n| !n.is_empty())
+        .collect())
 }
 
 /// Run all preflight checks and return the results.
