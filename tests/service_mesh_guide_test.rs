@@ -151,7 +151,7 @@ proptest! {
             // Strip the SPIFFE path prefix if present (e.g. "cluster.local/ns/stellar/sa/stellar-core")
             let account = identity
                 .split('/')
-                .last()
+                .next_back()
                 .unwrap_or(identity.as_str());
             prop_assert!(
                 known_accounts.contains(&account),
