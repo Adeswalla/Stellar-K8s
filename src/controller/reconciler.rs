@@ -596,6 +596,25 @@ pub(crate) async fn apply_stellar_node(
         return Err(Error::ValidationError(message));
     }
 
+    // Network safety check — must run before any resources are created.
+    // Ensures no Mainnet node shares a namespace with a Testnet node (or vice versa).
+    if let Err(e) = super::network_isolation::check_network_safety(client, node).await {
+        let msg = e.to_string();
+        warn!("Network safety check failed for {}/{}: {}", namespace, name, msg);
+        emit_event(
+            client,
+            &ctx.event_reporter,
+            node,
+            kube::runtime::events::EventType::Warning,
+            "NetworkSafetyViolation",
+            "NetworkIsolation",
+            &msg,
+        )
+        .await?;
+        update_status(client, node, "Failed", Some(&msg), 0, true).await?;
+        return Err(e);
+    }
+
     let propagated_labels = LabelPropagator::new(node).compute();
 
     // Enforce PSS 'restricted' on the managed namespace (idempotent)

@@ -53,6 +53,7 @@ pub mod schema_utils;
 pub mod seed_secret;
 pub mod service_mesh;
 mod stellar_node;
+pub mod stellar_benchmark;
 pub mod types;
 
 #[cfg(test)]
@@ -65,6 +66,13 @@ pub use service_mesh::{
     ServiceMeshConfig,
 };
 pub use stellar_node::{
-    BGPStatus, SpecValidationError, StellarNode, StellarNodeSpec, StellarNodeStatus,
+    BGPStatus, SnapshotBootstrapStatus, SpecValidationError, StellarNode, StellarNodeSpec,
+    StellarNodeStatus,
+};
+pub use stellar_benchmark::{
+    BenchmarkConfig, BenchmarkMetrics, BenchmarkPhase, BenchmarkReport, BenchmarkReportSpec,
+    BenchmarkReportStatus, BenchmarkResourceRequirements, BenchmarkSummary, EnvVar as BenchmarkEnvVar,
+    PodResult, ResultStorage, StellarBenchmark, StellarBenchmarkSpec, StellarBenchmarkStatus,
+    Toleration as BenchmarkToleration,
 };
 pub use types::*;

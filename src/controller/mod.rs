@@ -48,11 +48,13 @@
 //! - Cleans up associated resources (Services, ConfigMaps, etc.)
 //! - Removes finalizer only after successful cleanup
 
+pub mod benchmark;
 pub mod blue_green;
 pub mod cross_cloud_failover;
 pub mod feature_flags;
 pub mod label_propagation;
 pub mod maintenance;
+pub mod network_isolation;
 pub mod pss;
 pub mod resource_meta;
 
@@ -99,6 +101,7 @@ mod resources;
 mod resources_test;
 pub mod service_mesh;
 mod snapshot;
+pub mod snapshot_worker;
 pub mod traffic;
 #[cfg(test)]
 mod traffic_test;
@@ -120,7 +123,12 @@ pub use feature_flags::{
     watch_feature_flags, FeatureFlags, SharedFeatureFlags, FEATURE_FLAGS_CONFIGMAP,
 };
 pub use finalizers::STELLAR_NODE_FINALIZER;
+pub use benchmark::run_benchmark_controller;
 pub use health::{check_node_health, HealthCheckResult};
+pub use network_isolation::{
+    check_network_safety, network_label_value, same_network_namespace_selector,
+    NetworkSafetyViolation, NAMESPACE_NETWORK_LABEL, NODE_NETWORK_LABEL,
+};
 pub use operator_config::{hardcoded_defaults, OperatorConfig};
 pub use peer_discovery::{
     get_peers_from_config_map, trigger_peer_config_reload, PeerDiscoveryConfig,
@@ -134,6 +142,7 @@ pub use pss::{
 pub use reconciler::reconcile_for_fuzz;
 pub use reconciler::{run_controller, ControllerState};
 pub use remediation::{can_remediate, check_stale_node, RemediationLevel, StaleCheckResult};
+pub use snapshot_worker::run_snapshot_worker;
 pub use service_mesh::{
     delete_service_mesh_resources, ensure_destination_rule, ensure_peer_authentication,
     ensure_request_authentication, ensure_virtual_service,

@@ -360,6 +360,34 @@ impl StellarNodeSpec {
             }
         }
 
+        // 2b. snapshotRef validation (applies to all node types)
+        if let Some(ref snap_ref) = self.storage.snapshot_ref {
+            let has_csi = snap_ref.volume_snapshot_name.is_some();
+            let has_backup = snap_ref.backup_url.is_some();
+
+            if has_csi && has_backup {
+                errors.push(SpecValidationError::new(
+                    "spec.storage.snapshotRef",
+                    "snapshotRef cannot specify both volumeSnapshotName and backupUrl simultaneously",
+                    "Use either volumeSnapshotName (CSI VolumeSnapshot) or backupUrl (compressed archive), not both.",
+                ));
+            }
+            if !has_csi && !has_backup {
+                errors.push(SpecValidationError::new(
+                    "spec.storage.snapshotRef",
+                    "snapshotRef must specify either volumeSnapshotName or backupUrl",
+                    "Set spec.storage.snapshotRef.volumeSnapshotName for CSI snapshot restore, or spec.storage.snapshotRef.backupUrl for compressed backup restore.",
+                ));
+            }
+            if has_backup && snap_ref.backup_url.as_deref().map(|u| u.is_empty()).unwrap_or(false) {
+                errors.push(SpecValidationError::new(
+                    "spec.storage.snapshotRef.backupUrl",
+                    "backupUrl must not be empty when set",
+                    "Provide a valid S3 or HTTPS URL for the compressed backup archive.",
+                ));
+            }
+        }
+
         // 3. Node Type Specific Logic
         match self.node_type {
             NodeType::Validator => {
@@ -1077,6 +1105,10 @@ pub struct StellarNodeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label_propagation_status: Option<String>,
 
+    /// Bootstrap status when the node was started from a snapshot or compressed backup.
+    /// Tracks the restore phase and time-to-sync for observability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_bootstrap: Option<SnapshotBootstrapStatus>,
     /// Cross-cloud failover status (Horizon/SorobanRpc nodes only)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cross_cloud_failover_status: Option<crate::crd::CrossCloudFailoverStatus>,
@@ -1099,6 +1131,44 @@ pub struct BGPStatus {
     /// Last BGP update time
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_update: Option<String>,
+}
+
+/// Status of a snapshot-based bootstrap operation.
+///
+/// Populated when `spec.storage.snapshotRef` or `spec.restoreFromSnapshot` is set.
+/// Tracks the restore phase and time-to-sync so operators can verify the
+/// "synced within 10 minutes" acceptance criterion.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotBootstrapStatus {
+    /// Current phase of the bootstrap operation.
+    /// One of: `Pending`, `Restoring`, `Restored`, `Syncing`, `Synced`, `Failed`
+    pub phase: String,
+
+    /// Source used for bootstrap (VolumeSnapshot name or backup URL).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
+    /// RFC3339 timestamp when the restore init container started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_started_at: Option<String>,
+
+    /// RFC3339 timestamp when the restore init container completed successfully.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_completed_at: Option<String>,
+
+    /// RFC3339 timestamp when the node first reached `Synced` state after bootstrap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synced_at: Option<String>,
+
+    /// Elapsed seconds from restore completion to first `Synced` state.
+    /// A value ≤ 600 satisfies the "synced within 10 minutes" acceptance criterion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seconds_to_sync: Option<u64>,
+
+    /// Human-readable message about the current bootstrap state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl StellarNodeStatus {

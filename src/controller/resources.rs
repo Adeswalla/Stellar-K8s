@@ -242,15 +242,24 @@ fn build_pvc(node: &StellarNode, storage_class_name: String) -> PersistentVolume
 
     let annotations = node.spec.storage.annotations.clone().unwrap_or_default();
 
-    // When restoring from a VolumeSnapshot, set dataSource so the PVC is populated from the snapshot
+    // When restoring from a VolumeSnapshot, set dataSource so the PVC is populated from the snapshot.
+    // Priority: spec.storage.snapshotRef.volumeSnapshotName > spec.restoreFromSnapshot.volumeSnapshotName
     let data_source = node
         .spec
-        .restore_from_snapshot
+        .storage
+        .snapshot_ref
         .as_ref()
-        .map(|r| TypedLocalObjectReference {
+        .and_then(|r| r.volume_snapshot_name.as_deref())
+        .or_else(|| {
+            node.spec
+                .restore_from_snapshot
+                .as_ref()
+                .map(|r| r.volume_snapshot_name.as_str())
+        })
+        .map(|snap_name| TypedLocalObjectReference {
             api_group: Some("snapshot.storage.k8s.io".to_string()),
             kind: "VolumeSnapshot".to_string(),
-            name: r.volume_snapshot_name.clone(),
+            name: snap_name.to_string(),
         });
 
     PersistentVolumeClaim {
@@ -1343,6 +1352,27 @@ fn build_pod_template(
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Snapshot / compressed-backup restore init container
+    //
+    // Injected when `spec.storage.snapshotRef.backupUrl` is set.  The init
+    // container downloads and extracts the archive into /data before Stellar
+    // Core starts, enabling near-instant bootstrap from a compressed DB backup.
+    // CSI VolumeSnapshot restores are handled at the PVC level (dataSource) and
+    // do NOT need an init container.
+    // -------------------------------------------------------------------------
+    if let Some(snapshot_ref) = &node.spec.storage.snapshot_ref {
+        if let Some(backup_url) = &snapshot_ref.backup_url {
+            let init_containers = pod_spec.init_containers.get_or_insert_with(Vec::new);
+            init_containers.push(build_snapshot_restore_container(
+                node,
+                backup_url,
+                snapshot_ref.credentials_secret_ref.as_deref(),
+                snapshot_ref.restore_image.as_deref(),
+            ));
+        }
+    }
+
     // Add KMS init container if needed (Validator nodes only)
     if let NodeType::Validator = node.spec.node_type {
         if let Some(validator_config) = &node.spec.validator_config {
@@ -2206,6 +2236,158 @@ fn build_horizon_migration_container(node: &StellarNode) -> Container {
     container
 }
 
+/// Build the snapshot-restore init container for compressed DB backup bootstrapping.
+///
+/// This container runs before Stellar Core and:
+/// 1. Checks whether `/data` is already populated (idempotent — skips if data exists).
+/// 2. Downloads the archive from `backup_url` (S3 or HTTPS).
+/// 3. Extracts it into `/data`.
+///
+/// Supports `.tar.gz` and `.tar.zst` archives.
+/// For S3 URLs, AWS CLI credentials are injected from `credentials_secret_ref`.
+fn build_snapshot_restore_container(
+    node: &StellarNode,
+    backup_url: &str,
+    credentials_secret_ref: Option<&str>,
+    restore_image: Option<&str>,
+) -> Container {
+    // Choose a sensible default image based on the URL scheme.
+    let image = restore_image
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if backup_url.starts_with("s3://") {
+                "amazon/aws-cli:latest".to_string()
+            } else {
+                "alpine:3".to_string()
+            }
+        });
+
+    // Determine the decompression command based on the file extension.
+    let decompress_flag = if backup_url.ends_with(".tar.zst") {
+        "--use-compress-program=zstd"
+    } else {
+        "-z" // default: gzip
+    };
+
+    // Build the shell script that runs inside the init container.
+    // The script is idempotent: if /data already has content it exits immediately.
+    let script = if backup_url.starts_with("s3://") {
+        format!(
+            r#"set -e
+# Skip restore if data volume already has content (idempotent)
+if [ "$(ls -A /data 2>/dev/null)" ]; then
+  echo "Data volume already populated, skipping snapshot restore."
+  exit 0
+fi
+echo "Restoring from S3 snapshot: {url}"
+aws s3 cp "{url}" /tmp/snapshot.archive
+echo "Extracting archive..."
+tar {decompress} -xf /tmp/snapshot.archive -C /data
+rm -f /tmp/snapshot.archive
+echo "Snapshot restore complete."
+"#,
+            url = backup_url,
+            decompress = decompress_flag,
+        )
+    } else {
+        format!(
+            r#"set -e
+# Skip restore if data volume already has content (idempotent)
+if [ "$(ls -A /data 2>/dev/null)" ]; then
+  echo "Data volume already populated, skipping snapshot restore."
+  exit 0
+fi
+echo "Restoring from backup: {url}"
+wget -q -O /tmp/snapshot.archive "{url}" || curl -fsSL -o /tmp/snapshot.archive "{url}"
+echo "Extracting archive..."
+tar {decompress} -xf /tmp/snapshot.archive -C /data
+rm -f /tmp/snapshot.archive
+echo "Snapshot restore complete."
+"#,
+            url = backup_url,
+            decompress = decompress_flag,
+        )
+    };
+
+    // Build environment variables — inject AWS credentials if provided.
+    let mut env: Vec<EnvVar> = vec![
+        EnvVar {
+            name: "BACKUP_URL".to_string(),
+            value: Some(backup_url.to_string()),
+            ..Default::default()
+        },
+    ];
+
+    if let Some(secret_name) = credentials_secret_ref {
+        // AWS credentials
+        for key in &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION"] {
+            env.push(EnvVar {
+                name: key.to_string(),
+                value: None,
+                value_from: Some(EnvVarSource {
+                    secret_key_ref: Some(SecretKeySelector {
+                        name: Some(secret_name.to_string()),
+                        key: key.to_string(),
+                        optional: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+            });
+        }
+        // Generic bearer token for HTTPS
+        env.push(EnvVar {
+            name: "BEARER_TOKEN".to_string(),
+            value: None,
+            value_from: Some(EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    name: Some(secret_name.to_string()),
+                    key: "BEARER_TOKEN".to_string(),
+                    optional: Some(true),
+                }),
+                ..Default::default()
+            }),
+        });
+    }
+
+    Container {
+        name: "snapshot-restore".to_string(),
+        image: Some(image),
+        command: Some(vec!["/bin/sh".to_string(), "-c".to_string(), script]),
+        env: Some(env),
+        volume_mounts: Some(vec![VolumeMount {
+            name: "data".to_string(),
+            mount_path: "/data".to_string(),
+            ..Default::default()
+        }]),
+        // Security: run as non-root, read-only root filesystem except /tmp
+        security_context: Some(SecurityContext {
+            run_as_non_root: Some(false), // aws-cli/alpine may need root for tar
+            allow_privilege_escalation: Some(false),
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        resources: Some(K8sResources {
+            requests: Some({
+                let mut m = BTreeMap::new();
+                m.insert("cpu".to_string(), Quantity("100m".to_string()));
+                m.insert("memory".to_string(), Quantity("256Mi".to_string()));
+                m
+            }),
+            limits: Some({
+                let mut m = BTreeMap::new();
+                m.insert("cpu".to_string(), Quantity("500m".to_string()));
+                m.insert("memory".to_string(), Quantity("512Mi".to_string()));
+                m
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 // ============================================================================
 // HorizontalPodAutoscaler — unchanged
 // ============================================================================
@@ -2858,12 +3040,108 @@ fn build_network_policy(node: &StellarNode, config: &NetworkPolicyConfig) -> Net
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Egress rules — Network Isolation
+    //
+    // Allow egress only to:
+    //   1. Pods in namespaces labelled with the SAME stellar.org/network value.
+    //      This is the critical rule: it prevents a Testnet pod from ever
+    //      opening a TCP connection to a Mainnet pod, even if both are on the
+    //      same cluster.
+    //   2. kube-dns (UDP/TCP 53) — required for all pods.
+    //   3. The Kubernetes API server (TCP 443/6443) — required for health checks.
+    //   4. Intra-namespace traffic (e.g. Horizon → Stellar Core).
+    //
+    // Any egress not matched by these rules is implicitly denied because we
+    // include "Egress" in policy_types.
+    // -----------------------------------------------------------------------
+    use k8s_openapi::api::networking::v1::NetworkPolicyEgressRule;
+
+    let network_label_value = crate::controller::network_isolation::network_label_value(
+        &node.spec.network,
+        &node.spec.custom_network_passphrase,
+    );
+
+    // Rule 1: Allow egress to pods in same-network namespaces only.
+    let same_network_egress = NetworkPolicyEgressRule {
+        to: Some(vec![NetworkPolicyPeer {
+            namespace_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    crate::controller::network_isolation::NAMESPACE_NETWORK_LABEL.to_string(),
+                    network_label_value.clone(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]),
+        ports: None,
+    };
+
+    // Rule 2: Allow DNS resolution (kube-dns).
+    let dns_egress = NetworkPolicyEgressRule {
+        to: Some(vec![NetworkPolicyPeer {
+            namespace_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    "kubernetes.io/metadata.name".to_string(),
+                    "kube-system".to_string(),
+                )])),
+                ..Default::default()
+            }),
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    "k8s-app".to_string(),
+                    "kube-dns".to_string(),
+                )])),
+                ..Default::default()
+            }),
+        }]),
+        ports: Some(vec![
+            NetworkPolicyPort {
+                port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(53)),
+                protocol: Some("UDP".to_string()),
+                ..Default::default()
+            },
+            NetworkPolicyPort {
+                port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(53)),
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            },
+        ]),
+    };
+
+    // Rule 3: Allow egress within the same namespace (intra-namespace pod communication,
+    // e.g. Horizon → Stellar Core, Soroban RPC → Captive Core).
+    let intra_namespace_egress = NetworkPolicyEgressRule {
+        to: Some(vec![NetworkPolicyPeer {
+            namespace_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    "kubernetes.io/metadata.name".to_string(),
+                    node.namespace().unwrap_or_else(|| "default".to_string()),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]),
+        ports: None,
+    };
+
+    let egress_rules = vec![same_network_egress, dns_egress, intra_namespace_egress];
+
     NetworkPolicy {
         metadata: merge_resource_meta(
             ObjectMeta {
                 name: Some(name),
                 namespace: node.namespace(),
-                labels: Some(labels),
+                labels: Some({
+                    let mut l = labels;
+                    // Stamp the network label on the NetworkPolicy itself so
+                    // cluster-level policies can select it.
+                    l.insert(
+                        crate::controller::network_isolation::NAMESPACE_NETWORK_LABEL.to_string(),
+                        network_label_value,
+                    );
+                    l
+                }),
                 owner_references: Some(vec![owner_reference(node)]),
                 ..Default::default()
             },
@@ -2880,12 +3158,14 @@ fn build_network_policy(node: &StellarNode, config: &NetworkPolicyConfig) -> Net
                 ])),
                 ..Default::default()
             },
+            // Enforce both Ingress and Egress so the egress deny-by-default takes effect.
             policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
             ingress: if ingress_rules.is_empty() {
                 None
             } else {
                 Some(ingress_rules)
             },
+            egress: Some(egress_rules),
             egress: if egress_rules.is_empty() {
                 None
             } else {

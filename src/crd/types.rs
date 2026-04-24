@@ -196,6 +196,55 @@ pub enum StorageMode {
     Local,
 }
 
+/// Reference to a pre-computed snapshot used to bootstrap a new node.
+///
+/// Supports two bootstrap mechanisms:
+/// - **CSI VolumeSnapshot**: A Kubernetes `VolumeSnapshot` object (snapshot.storage.k8s.io/v1)
+///   that the operator uses as the PVC `dataSource` for near-instant volume cloning.
+/// - **Compressed backup**: A `.tar.gz` (or `.tar.zst`) archive stored in an S3-compatible
+///   bucket or a Kubernetes PVC. The operator injects an init container that downloads and
+///   extracts the archive into the data volume before Stellar Core starts.
+///
+/// Only one of `volume_snapshot_name` or `backup_url` should be set.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotRef {
+    /// Name of an existing `VolumeSnapshot` (snapshot.storage.k8s.io/v1) in the same namespace.
+    /// When set, the PVC is provisioned from this snapshot — no init container is needed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_snapshot_name: Option<String>,
+
+    /// Optional namespace of the VolumeSnapshot when it lives in a different namespace.
+    /// Requires `CrossNamespaceVolumeDataSource` feature gate on the cluster.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_snapshot_namespace: Option<String>,
+
+    /// URL of a compressed DB backup archive (`.tar.gz` or `.tar.zst`).
+    ///
+    /// Supported schemes:
+    /// - `s3://bucket/path/to/backup.tar.gz`
+    /// - `https://host/path/to/backup.tar.gz`
+    ///
+    /// The operator injects an init container (`snapshot-restore`) that downloads and
+    /// extracts the archive into `/data` before Stellar Core starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_url: Option<String>,
+
+    /// Name of a Kubernetes Secret containing credentials for the backup URL.
+    ///
+    /// For S3 URLs the secret must have keys `AWS_ACCESS_KEY_ID` and
+    /// `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_DEFAULT_REGION`).
+    /// For HTTPS URLs the secret may have a `BEARER_TOKEN` key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials_secret_ref: Option<String>,
+
+    /// Container image used for the restore init container.
+    /// Must have `aws` CLI (for S3) or `curl`/`wget` plus `tar` available.
+    /// Defaults to `amazon/aws-cli:latest` for S3 URLs and `alpine:3` for HTTPS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_image: Option<String>,
+}
+
 /// Storage configuration for persistent data
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -212,6 +261,17 @@ pub struct StorageConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "super::schema_utils::object_schema")]
     pub node_affinity: Option<k8s_openapi::api::core::v1::NodeAffinity>,
+
+    /// Bootstrap this node from a pre-computed snapshot or compressed DB backup.
+    ///
+    /// When set, the operator either:
+    /// - Provisions the PVC from a CSI `VolumeSnapshot` (zero-copy, near-instant), or
+    /// - Injects a `snapshot-restore` init container that downloads and extracts a
+    ///   compressed archive before Stellar Core starts.
+    ///
+    /// This reduces catch-up time from days to minutes for new validator nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_ref: Option<SnapshotRef>,
 }
 
 impl Default for StorageConfig {
@@ -223,6 +283,7 @@ impl Default for StorageConfig {
             retention_policy: RetentionPolicy::default(),
             annotations: None,
             node_affinity: None,
+            snapshot_ref: None,
         }
     }
 }
