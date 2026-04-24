@@ -1109,16 +1109,18 @@ pub(crate) async fn apply_stellar_node(
                         }
 
                         if is_canary_active {
-                            // 2. Monitor Canary: we are in the middle of a rollout
+                            // 2. Monitor Canary: manage both deployments and sync ingress weights
                             resources::ensure_canary_deployment(client, node, ctx.enable_mtls, ctx.dry_run).await?;
                             resources::ensure_canary_service(client, node, ctx.enable_mtls, ctx.dry_run).await?;
 
                             let mut stable_node = node.clone();
-                            // Recover the stable version from the existing deployment if possible
                             if let Some(cv) = &current_version {
                                 stable_node.spec.version = cv.clone();
                             }
                             resources::ensure_deployment(client, &stable_node, ctx.enable_mtls, &propagated_labels, ctx.dry_run).await?;
+
+                            // Sync ingress traffic weights (Nginx annotations + Istio VirtualService)
+                            resources::ensure_ingress(client, node, ctx.dry_run).await?;
 
                             // Check if the canary interval has elapsed
                             if let Some(status) = &node.status {
@@ -1128,66 +1130,120 @@ pub(crate) async fn apply_stellar_node(
                                         let elapsed_secs = now.signed_duration_since(start_time).num_seconds();
 
                                         if elapsed_secs >= cfg.check_interval_seconds as i64 {
-                                            // 3. Evaluate Canary: interval elapsed, check health
+                                            // 3. Evaluate: check pod health + HTTP error rate
                                             info!(
-                                                "Canary check interval elapsed ({} >= {}). Evaluating canary health.",
+                                                "Canary check interval elapsed ({} >= {}s). Evaluating.",
                                                 elapsed_secs, cfg.check_interval_seconds
                                             );
 
                                             let canary_health = check_canary_health(client, node).await?;
-
                                             let api: Api<StellarNode> = Api::namespaced(client.clone(), &namespace);
+
                                             if canary_health.healthy {
-                                                // 4a. Promote Canary
-                                                info!("Canary {}/{} is healthy. Promoting to stable.", namespace, name);
-                                                resources::ensure_deployment(client, node, ctx.enable_mtls, &propagated_labels, ctx.dry_run).await?;
-                                                resources::delete_canary_resources(client, node, ctx.dry_run).await?;
+                                                let consecutive = status.canary_consecutive_healthy + 1;
+                                                let current_weight = status.canary_weight.unwrap_or(cfg.weight);
+                                                let next_weight = if cfg.step_weight > 0 {
+                                                    (current_weight + cfg.step_weight).min(cfg.max_weight)
+                                                } else {
+                                                    current_weight
+                                                };
 
-                                                let patch = serde_json::json!({
-                                                    "status": {
-                                                        "canaryVersion": null,
-                                                        "canaryStartTime": null,
-                                                        "phase": "Running"
-                                                    }
-                                                });
-                                                api.patch_status(
-                                                    &name,
-                                                    &PatchParams::apply("stellar-operator"),
-                                                    &Patch::Merge(&patch),
-                                                ).await?;
+                                                if consecutive >= cfg.success_threshold
+                                                    && next_weight >= cfg.max_weight
+                                                {
+                                                    // 4a. Promote — enough healthy checks at max weight
+                                                    info!(
+                                                        "Canary {}/{} healthy ({}/{} checks). Promoting.",
+                                                        namespace, name, consecutive, cfg.success_threshold
+                                                    );
+                                                    resources::ensure_deployment(client, node, ctx.enable_mtls, &propagated_labels, ctx.dry_run).await?;
+                                                    resources::delete_canary_resources(client, node, ctx.dry_run).await?;
+
+                                                    let recorder = recorder_for(client, &ctx.event_reporter, node);
+                                                    let _ = publish_object_event(
+                                                        &recorder,
+                                                        EventType::Normal,
+                                                        "CanaryPromoted",
+                                                        "Canary",
+                                                        &format!(
+                                                            "Canary version {} promoted to stable after {} healthy checks",
+                                                            node.spec.version, consecutive
+                                                        ),
+                                                    ).await;
+
+                                                    let patch = serde_json::json!({
+                                                        "status": {
+                                                            "canaryVersion": null,
+                                                            "canaryStartTime": null,
+                                                            "canaryWeight": null,
+                                                            "canaryErrorRate": null,
+                                                            "canaryConsecutiveHealthy": 0,
+                                                            "phase": "Running"
+                                                        }
+                                                    });
+                                                    api.patch_status(&name, &PatchParams::apply("stellar-operator"), &Patch::Merge(&patch)).await?;
+                                                } else {
+                                                    // Step up weight, reset interval timer
+                                                    info!(
+                                                        "Canary {}/{} healthy (check {}/{}). Weight {} -> {}.",
+                                                        namespace, name, consecutive, cfg.success_threshold,
+                                                        current_weight, next_weight
+                                                    );
+                                                    let patch = serde_json::json!({
+                                                        "status": {
+                                                            "canaryWeight": next_weight,
+                                                            "canaryConsecutiveHealthy": consecutive,
+                                                            "canaryStartTime": Utc::now().to_rfc3339()
+                                                        }
+                                                    });
+                                                    api.patch_status(&name, &PatchParams::apply("stellar-operator"), &Patch::Merge(&patch)).await?;
+                                                }
                                             } else {
-                                                // 4b. Rollback Canary
-                                                warn!("Canary {}/{} is unhealthy. Rolling back.", namespace, name);
+                                                // 4b. Rollback — error rate spiked or pod unhealthy
+                                                warn!(
+                                                    "Canary {}/{} unhealthy. Rolling back. Reason: {}",
+                                                    namespace, name, canary_health.message
+                                                );
                                                 resources::delete_canary_resources(client, node, ctx.dry_run).await?;
 
-                                                // Clean up canary status, emitting failure message
-                                                let message = format!("Canary rollback triggered due to failed health check: {}", canary_health.message);
+                                                let message = format!(
+                                                    "Canary rollback triggered: {}",
+                                                    canary_health.message
+                                                );
+
+                                                let recorder = recorder_for(client, &ctx.event_reporter, node);
+                                                let _ = publish_object_event(
+                                                    &recorder,
+                                                    EventType::Warning,
+                                                    "CanaryRolledBack",
+                                                    "Canary",
+                                                    &message,
+                                                ).await;
+
                                                 let patch = serde_json::json!({
                                                     "status": {
                                                         "canaryVersion": null,
                                                         "canaryStartTime": null,
+                                                        "canaryWeight": null,
+                                                        "canaryErrorRate": null,
+                                                        "canaryConsecutiveHealthy": 0,
                                                         "phase": "Failed",
                                                         "message": message
                                                     }
                                                 });
-                                                api.patch_status(
-                                                    &name,
-                                                    &PatchParams::apply("stellar-operator"),
-                                                    &Patch::Merge(&patch),
-                                                ).await?;
+                                                api.patch_status(&name, &PatchParams::apply("stellar-operator"), &Patch::Merge(&patch)).await?;
 
-                                                // Create a k8s event for the rollback
                                                 let _ = remediation::emit_remediation_event(
                                                     client,
                                                     &ctx.event_reporter,
                                                     node,
-                                                    remediation::RemediationLevel::Restart, // Not exactly a restart but conceptually similar action
+                                                    remediation::RemediationLevel::Restart,
                                                     &message,
                                                 ).await;
                                             }
                                         } else {
                                             debug!(
-                                                "Canary interval not yet elapsed: {} < {} seconds",
+                                                "Canary interval not yet elapsed: {} < {}s",
                                                 elapsed_secs, cfg.check_interval_seconds
                                             );
                                         }
@@ -2166,14 +2222,115 @@ async fn check_canary_health(
     client: &Client,
     node: &StellarNode,
 ) -> Result<health::HealthCheckResult> {
-    let _namespace = node.namespace().unwrap_or_else(|| "default".to_string());
-    let name = format!("{}-canary", node.name_any());
+    let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
+    let canary_name = format!("{}-canary", node.name_any());
 
     // Create a temporary node with the canary name to use the existing health check logic
     let mut canary_node = node.clone();
-    canary_node.metadata.name = Some(name);
+    canary_node.metadata.name = Some(canary_name.clone());
 
-    health::check_node_health(client, &canary_node, None).await
+    // 1. Basic pod readiness check
+    let readiness = health::check_node_health(client, &canary_node, None).await?;
+    if !readiness.healthy {
+        return Ok(readiness);
+    }
+
+    // 2. HTTP error rate check against the canary service
+    let max_error_rate = node
+        .spec
+        .strategy
+        .canary()
+        .map(|c| c.max_error_rate)
+        .unwrap_or(0.05);
+
+    match measure_canary_error_rate(client, node, &namespace).await {
+        Ok(error_rate) => {
+            if error_rate > max_error_rate {
+                return Ok(health::HealthCheckResult::unhealthy(format!(
+                    "Canary error rate {:.1}% exceeds threshold {:.1}%",
+                    error_rate * 100.0,
+                    max_error_rate * 100.0,
+                )));
+            }
+            Ok(health::HealthCheckResult::synced(readiness.ledger_sequence))
+        }
+        Err(e) => {
+            // If we can't measure error rate, fall back to readiness only
+            warn!(
+                "Could not measure canary error rate for {}/{}: {}. Falling back to readiness.",
+                namespace,
+                node.name_any(),
+                e
+            );
+            Ok(readiness)
+        }
+    }
+}
+
+/// Measure the 4xx/5xx error rate on the canary service by sampling its /metrics or /health.
+///
+/// Queries the canary pod directly and counts non-2xx responses over a short window.
+/// Returns a value in [0.0, 1.0].
+async fn measure_canary_error_rate(
+    client: &Client,
+    node: &StellarNode,
+    namespace: &str,
+) -> Result<f64> {
+    use k8s_openapi::api::core::v1::Pod;
+    use std::time::Duration;
+
+    let canary_name = format!("{}-canary", node.name_any());
+    let pod_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let lp = kube::api::ListParams::default()
+        .labels(&format!("app.kubernetes.io/instance={canary_name}"));
+
+    let pods = pod_api.list(&lp).await.map_err(Error::KubeError)?;
+    let pod = pods
+        .items
+        .iter()
+        .find(|p| {
+            p.status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .map(|conds| {
+                    conds
+                        .iter()
+                        .any(|c| c.type_ == "Ready" && c.status == "True")
+                })
+                .unwrap_or(false)
+        });
+
+    let pod_ip = match pod.and_then(|p| p.status.as_ref()?.pod_ip.as_deref()) {
+        Some(ip) => ip.to_string(),
+        None => return Err(Error::ConfigError("No ready canary pod found".to_string())),
+    };
+
+    // Probe the Horizon /health endpoint multiple times to estimate error rate
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| Error::ConfigError(format!("HTTP client error: {e}")))?;
+
+    let url = format!("http://{pod_ip}:8000/health");
+    let sample_count = 5u32;
+    let mut errors = 0u32;
+
+    for _ in 0..sample_count {
+        match http_client.get(&url).send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if status >= 400 {
+                    errors += 1;
+                }
+            }
+            Err(_) => {
+                errors += 1;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    Ok(errors as f64 / sample_count as f64)
 }
 
 /// Update status for suspended nodes

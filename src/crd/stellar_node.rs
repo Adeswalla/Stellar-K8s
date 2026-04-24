@@ -1051,6 +1051,18 @@ pub struct StellarNodeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canary_start_time: Option<String>,
 
+    /// Current traffic weight routed to the canary (0–100)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canary_weight: Option<i32>,
+
+    /// Observed 4xx/5xx error rate on the canary in the last analysis window (0.0–1.0)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canary_error_rate: Option<f64>,
+
+    /// Number of consecutive successful health checks for the current canary
+    #[serde(default)]
+    pub canary_consecutive_healthy: i32,
+
     /// Version of the database schema after last successful migration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_migrated_version: Option<String>,
@@ -1261,6 +1273,7 @@ mod tests {
                 canary: Some(CanaryConfig {
                     weight: 10,
                     check_interval_seconds: 300,
+                    ..Default::default()
                 }),
             },
             ..Default::default()
@@ -1287,6 +1300,7 @@ mod tests {
                 canary: Some(CanaryConfig {
                     weight: 20,
                     check_interval_seconds: 300,
+                    ..Default::default()
                 }),
             },
             ..Default::default()

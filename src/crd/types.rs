@@ -714,7 +714,7 @@ pub enum RolloutStrategyType {
 }
 
 /// Rollout strategy for updates
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RolloutStrategy {
     #[serde(rename = "type")]
@@ -734,13 +734,35 @@ impl RolloutStrategy {
 }
 
 /// Configuration for Canary rollout
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CanaryConfig {
+    /// Initial traffic weight sent to the canary (0–100). Default: 10
     #[serde(default = "default_canary_weight")]
     pub weight: i32,
+
+    /// How often (seconds) to evaluate canary health before promoting or rolling back.
+    /// Default: 300 (5 minutes)
     #[serde(default = "default_canary_interval")]
     pub check_interval_seconds: i32,
+
+    /// Maximum 4xx/5xx error rate (0.0–1.0) allowed before triggering automatic rollback.
+    /// E.g. 0.05 = 5%. Default: 0.05
+    #[serde(default = "default_max_error_rate")]
+    pub max_error_rate: f64,
+
+    /// When set, the operator progressively increases canary weight by this amount
+    /// each check interval until `max_weight` is reached. Default: 0 (no stepping)
+    #[serde(default)]
+    pub step_weight: i32,
+
+    /// Maximum weight the canary may reach during progressive rollout. Default: 50
+    #[serde(default = "default_max_weight")]
+    pub max_weight: i32,
+
+    /// Number of consecutive healthy checks required before promoting. Default: 1
+    #[serde(default = "default_canary_success_threshold")]
+    pub success_threshold: i32,
 }
 
 fn default_canary_weight() -> i32 {
@@ -749,6 +771,18 @@ fn default_canary_weight() -> i32 {
 
 fn default_canary_interval() -> i32 {
     300
+}
+
+fn default_max_error_rate() -> f64 {
+    0.05
+}
+
+fn default_max_weight() -> i32 {
+    50
+}
+
+fn default_canary_success_threshold() -> i32 {
+    1
 }
 
 /// Load Balancer configuration for external access via MetalLB

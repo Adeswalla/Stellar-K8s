@@ -1117,6 +1117,14 @@ pub async fn ensure_ingress(client: &Client, node: &StellarNode, dry_run: bool) 
             let mut canary_ingress = build_ingress(node, ingress_cfg);
             canary_ingress.metadata.name = Some(canary_name.clone());
 
+            // Use the live canary weight from status if available (progressive stepping),
+            // otherwise fall back to the configured initial weight.
+            let effective_weight = node
+                .status
+                .as_ref()
+                .and_then(|s| s.canary_weight)
+                .unwrap_or(cfg.weight);
+
             let mut annotations = canary_ingress
                 .metadata
                 .annotations
@@ -1128,11 +1136,11 @@ pub async fn ensure_ingress(client: &Client, node: &StellarNode, dry_run: bool) 
             );
             annotations.insert(
                 "nginx.ingress.kubernetes.io/canary-weight".to_string(),
-                cfg.weight.to_string(),
+                effective_weight.to_string(),
             );
             annotations.insert(
                 "traefik.ingress.kubernetes.io/service.weights".to_string(),
-                format!("{}:{}", node.name_any(), cfg.weight),
+                format!("{}:{}", node.name_any(), effective_weight),
             );
 
             canary_ingress.metadata.annotations = Some(annotations);
@@ -1158,9 +1166,157 @@ pub async fn ensure_ingress(client: &Client, node: &StellarNode, dry_run: bool) 
             )
             .await?;
             info!("Canary Ingress ensured for {}/{}", namespace, canary_name);
+
+            // Istio VirtualService traffic splitting (when ingress class is "istio")
+            if ingress_cfg
+                .class_name
+                .as_deref()
+                .map(|c| c == "istio")
+                .unwrap_or(false)
+            {
+                ensure_istio_canary_virtual_service(
+                    client,
+                    node,
+                    ingress_cfg,
+                    effective_weight,
+                    dry_run,
+                )
+                .await?;
+            }
         } else {
             let canary_name = format!("{name}-canary");
             let _ = api.delete(&canary_name, &delete_params(dry_run)).await;
+
+            // Clean up Istio VirtualService if it exists
+            if ingress_cfg
+                .class_name
+                .as_deref()
+                .map(|c| c == "istio")
+                .unwrap_or(false)
+            {
+                delete_istio_canary_virtual_service(client, node, dry_run).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Ensure an Istio VirtualService that splits traffic between stable and canary services.
+///
+/// Creates a VirtualService using the Istio networking API via DynamicObject.
+/// The stable service receives `(100 - weight)%` and the canary receives `weight%`.
+async fn ensure_istio_canary_virtual_service(
+    client: &Client,
+    node: &StellarNode,
+    ingress_cfg: &IngressConfig,
+    canary_weight: i32,
+    _dry_run: bool,
+) -> Result<()> {
+    use kube::api::DynamicObject;
+    use kube::discovery::ApiResource;
+
+    let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
+    let stable_weight = 100 - canary_weight.clamp(0, 100);
+    let vs_name = format!("{}-canary-vs", node.name_any());
+
+    let hosts: Vec<String> = ingress_cfg
+        .hosts
+        .iter()
+        .map(|h| h.host.clone())
+        .collect();
+
+    let api_resource = ApiResource {
+        group: "networking.istio.io".to_string(),
+        version: "v1beta1".to_string(),
+        api_version: "networking.istio.io/v1beta1".to_string(),
+        kind: "VirtualService".to_string(),
+        plural: "virtualservices".to_string(),
+    };
+
+    let mut vs = DynamicObject::new(&vs_name, &api_resource).within(&namespace);
+    vs.data = serde_json::json!({
+        "spec": {
+            "hosts": hosts,
+            "http": [{
+                "route": [
+                    {
+                        "destination": {
+                            "host": node.name_any(),
+                            "port": { "number": 8000 }
+                        },
+                        "weight": stable_weight
+                    },
+                    {
+                        "destination": {
+                            "host": format!("{}-canary", node.name_any()),
+                            "port": { "number": 8000 }
+                        },
+                        "weight": canary_weight
+                    }
+                ]
+            }]
+        }
+    });
+
+    let api: kube::Api<DynamicObject> =
+        kube::Api::namespaced_with(client.clone(), &namespace, &api_resource);
+
+    match api
+        .patch(
+            &vs_name,
+            &PatchParams::apply("stellar-operator").force(),
+            &Patch::Apply(&vs),
+        )
+        .await
+    {
+        Ok(_) => {
+            info!(
+                "Istio VirtualService {}/{} updated: stable={}% canary={}%",
+                namespace, vs_name, stable_weight, canary_weight
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                "Failed to apply Istio VirtualService (Istio may not be installed): {}",
+                e
+            );
+            Ok(()) // Non-fatal — Nginx annotations still work
+        }
+    }
+}
+
+/// Delete the Istio VirtualService for a canary rollout.
+async fn delete_istio_canary_virtual_service(
+    client: &Client,
+    node: &StellarNode,
+    _dry_run: bool,
+) -> Result<()> {
+    use kube::api::DynamicObject;
+    use kube::discovery::ApiResource;
+
+    let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
+    let vs_name = format!("{}-canary-vs", node.name_any());
+
+    let api_resource = ApiResource {
+        group: "networking.istio.io".to_string(),
+        version: "v1beta1".to_string(),
+        api_version: "networking.istio.io/v1beta1".to_string(),
+        kind: "VirtualService".to_string(),
+        plural: "virtualservices".to_string(),
+    };
+
+    let api: kube::Api<DynamicObject> =
+        kube::Api::namespaced_with(client.clone(), &namespace, &api_resource);
+
+    match api.delete(&vs_name, &DeleteParams::default()).await {
+        Ok(_) => {
+            info!("Deleted Istio VirtualService {}/{}", namespace, vs_name);
+        }
+        Err(kube::Error::Api(e)) if e.code == 404 => {}
+        Err(e) => {
+            warn!("Failed to delete Istio VirtualService: {}", e);
         }
     }
 
