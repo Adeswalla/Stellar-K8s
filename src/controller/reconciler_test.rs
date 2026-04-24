@@ -354,6 +354,7 @@ VALIDATORS=["VALIDATOR1", "VALIDATOR2"]"#
             log_reload_handle: make_reload_handle(),
             log_level_expires_at: Arc::new(tokio::sync::Mutex::new(None)),
             last_event_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            job_registry: Arc::new(super::background_jobs::JobRegistry::new()),
             audit_log: Arc::new(super::audit_log::AuditLog::new()),
             oidc_config: None,
         });
@@ -398,6 +399,7 @@ VALIDATORS=["VALIDATOR1", "VALIDATOR2"]"#
             log_reload_handle: make_reload_handle(),
             log_level_expires_at: Arc::new(tokio::sync::Mutex::new(None)),
             last_event_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            job_registry: Arc::new(super::background_jobs::JobRegistry::new()),
             audit_log: Arc::new(super::audit_log::AuditLog::new()),
             oidc_config: None,
         });
@@ -441,6 +443,7 @@ VALIDATORS=["VALIDATOR1", "VALIDATOR2"]"#
             log_level_expires_at: Arc::new(tokio::sync::Mutex::new(None)),
             log_reload_handle: make_reload_handle(),
             last_event_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            job_registry: Arc::new(super::background_jobs::JobRegistry::new()),
             audit_log: Arc::new(super::audit_log::AuditLog::new()),
             oidc_config: None,
         });
@@ -676,6 +679,7 @@ VALIDATORS=["VALIDATOR1", "VALIDATOR2"]"#
             log_reload_handle: make_reload_handle(),
             log_level_expires_at: Arc::new(tokio::sync::Mutex::new(None)),
             last_event_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            job_registry: Arc::new(super::background_jobs::JobRegistry::new()),
             audit_log: Arc::new(super::audit_log::AuditLog::new()),
             oidc_config: None,
         };
@@ -715,6 +719,7 @@ VALIDATORS=["VALIDATOR1", "VALIDATOR2"]"#
             log_reload_handle: make_reload_handle(),
             log_level_expires_at: Arc::new(tokio::sync::Mutex::new(None)),
             last_event_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            job_registry: Arc::new(super::background_jobs::JobRegistry::new()),
             audit_log: Arc::new(super::audit_log::AuditLog::new()),
             oidc_config: None,
         };

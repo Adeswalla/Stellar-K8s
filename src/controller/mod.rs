@@ -61,6 +61,7 @@ pub mod pss;
 pub mod resource_meta;
 
 mod archive_health;
+pub mod background_jobs;
 pub mod db_pool;
 pub mod archive_prune;
 pub mod audit;
@@ -148,6 +149,7 @@ pub use pss::{
     restricted_pod_security_context, validate_pss_compliance, PssViolation,
 };
 #[cfg(feature = "reconciler-fuzz")]
+pub use background_jobs::{JobKind, JobRecord, JobRegistry, JobState, MAX_JOBS};
 pub use db_pool::{create_pool, DbPoolConfig, DEFAULT_CONNECTION_TIMEOUT_SECS, DEFAULT_MAX_CONNECTIONS};
 pub use reconciler::reconcile_for_fuzz;
 pub use reconciler::{run_controller, BatchSummaryReport, ControllerState};

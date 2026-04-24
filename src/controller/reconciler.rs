@@ -214,6 +214,8 @@ pub struct ControllerState {
         std::sync::Arc<tokio::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
     /// Timestamp of the last event received from the K8s watch stream
     pub last_event_received: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Background job registry for the monitoring dashboard.
+    pub job_registry: std::sync::Arc<super::background_jobs::JobRegistry>,
     /// In-memory audit log for admin activity.
     pub audit_log: std::sync::Arc<super::audit_log::AuditLog>,
     /// Optional OIDC configuration for JWT-based authentication on the REST API.

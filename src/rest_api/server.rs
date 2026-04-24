@@ -21,6 +21,7 @@ use crate::controller::ControllerState;
 use crate::{Error, Result};
 
 use super::auth;
+use super::job_handlers;
 use super::audit_handlers;
 use super::custom_metrics;
 use super::dashboard_handlers;
@@ -117,6 +118,9 @@ pub async fn run_server(
         .route("/api/v1/dashboard/operator/logs", get(dashboard_handlers::get_operator_logs))
         // Documentation search API
         .route("/api/v1/docs/search-index", get(handlers::get_search_index))
+        // Background job monitoring dashboard
+        .route("/api/v1/jobs", get(job_handlers::list_jobs))
+        .route("/api/v1/jobs/stats", get(job_handlers::job_stats))
         // Audit log
         .route("/api/v1/audit-log", get(audit_handlers::list_audit_log))
         .route("/api/v1/audit-log/search", get(audit_handlers::search_audit_log))
