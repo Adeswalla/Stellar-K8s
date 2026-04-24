@@ -11,7 +11,7 @@ mod tests {
 
     use crate::controller::resources::build_topology_spread_constraints;
     use crate::crd::{
-        types::{PodAntiAffinityStrength, ResourceRequirements, ResourceSpec, StorageConfig},
+        types::{PodAntiAffinityStrength, ResourceRequirements, ResourceSpec},
         NodeType, StellarNetwork, StellarNodeSpec,
     };
 
@@ -24,7 +24,6 @@ mod tests {
             node_type,
             network: StellarNetwork::Testnet,
             version: "v21.0.0".to_string(),
-            history_mode: Default::default(),
             resources: ResourceRequirements {
                 requests: ResourceSpec {
                     cpu: "500m".to_string(),
@@ -35,10 +34,6 @@ mod tests {
                     memory: "4Gi".to_string(),
                 },
             },
-            storage: StorageConfig::default(),
-            validator_config: None,
-            horizon_config: None,
-            soroban_config: None,
             replicas: 3,
             min_available: None,
             max_unavailable: None,
@@ -57,17 +52,28 @@ mod tests {
             network_policy: None,
             dr_config: None,
             pod_anti_affinity: Default::default(),
+            placement: Default::default(),
             topology_spread_constraints: None,
             cve_handling: None,
             snapshot_schedule: None,
             restore_from_snapshot: None,
             read_replica_config: None,
             read_pool_endpoint: None,
+            sidecars: None,
             db_maintenance_config: None,
             oci_snapshot: None,
             service_mesh: None,
             forensic_snapshot: None,
+            label_propagation: None,
             resource_meta: None,
+            history_mode: Default::default(),
+            storage: Default::default(),
+            validator_config: None,
+            horizon_config: None,
+            soroban_config: None,
+            nat_traversal: None,
+            custom_network_passphrase: None,
+            cross_cloud_failover: None,
         }
     }
 
@@ -307,11 +313,69 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::controller::resources::{
-        build_config_map_for_test, build_deployment_for_test, build_pvc_for_test,
-        build_service_for_test, build_statefulset_for_test, owner_reference, standard_labels,
+        build_config_map_for_test, build_deployment_for_test, build_network_policy,
+        build_pvc_for_test, build_service_for_test, build_statefulset_for_test,
+        merge_workload_affinity, owner_reference, standard_labels,
     };
+    use crate::crd::types::ValidatorConfig;
     use crate::crd::StellarNode;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    #[test]
+    fn test_scp_aware_anti_affinity_injection() {
+        let mut node = make_node(NodeType::Validator);
+        node.spec.placement.scp_aware_anti_affinity = true;
+        node.spec.validator_config = Some(ValidatorConfig {
+            seed_secret_ref: String::new(),
+            seed_secret_source: None,
+            quorum_set: Some(
+                r#"
+[VALIDATORS]
+peer-1 = "G..."
+peer-2 = "G..."
+"#
+                .to_string(),
+            ),
+            enable_history_archive: false,
+            history_archive_urls: vec![],
+            catchup_complete: false,
+            key_source: Default::default(),
+            kms_config: None,
+            vl_source: None,
+            hsm_config: None,
+        });
+
+        let affinity = merge_workload_affinity(&node).expect("affinity should be generated");
+        let pa = affinity
+            .pod_anti_affinity
+            .expect("podAntiAffinity should be generated");
+        let preferred = pa
+            .preferred_during_scheduling_ignored_during_execution
+            .expect("preferred terms should be generated");
+
+        assert_eq!(preferred.len(), 2);
+
+        let instances: Vec<String> = preferred
+            .iter()
+            .filter_map(|t| {
+                t.pod_affinity_term
+                    .label_selector
+                    .as_ref()?
+                    .match_labels
+                    .as_ref()?
+                    .get("app.kubernetes.io/instance")
+                    .cloned()
+            })
+            .collect();
+
+        assert!(instances.contains(&"peer-1".to_string()));
+        assert!(instances.contains(&"peer-2".to_string()));
+
+        for t in preferred {
+            assert_eq!(t.pod_affinity_term.topology_key, "kubernetes.io/hostname");
+            assert_eq!(t.weight, 100);
+        }
+    }
 
     fn make_node(node_type: NodeType) -> StellarNode {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -474,5 +538,48 @@ mod tests {
             component.to_lowercase().contains("horizon"),
             "component label should reflect horizon type, got: {component}"
         );
+    }
+
+    #[test]
+    fn test_network_policy_stellar_native_egress() {
+        let mut node = make_node(NodeType::Validator);
+        let mut vc = ValidatorConfig::default();
+        vc.known_peers = Some(r#"["1.2.3.4:11625", "example.com:11625"]"#.to_string());
+        vc.quorum_set = Some(r#"[VALIDATORS]
+"5.6.7.8" = "G..."
+"G..." = "G..."
+"#.to_string());
+        node.spec.validator_config = Some(vc);
+        
+        let config = crate::crd::types::NetworkPolicyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        
+        let netpol = build_network_policy(&node, &config);
+        let spec = netpol.spec.expect("spec must be present");
+        
+        assert!(spec.policy_types.as_ref().unwrap().contains(&"Ingress".to_string()));
+        assert!(spec.policy_types.as_ref().unwrap().contains(&"Egress".to_string()));
+        
+        let egress = spec.egress.expect("egress rules must be present");
+        
+        // 1. DNS egress
+        let has_dns = egress.iter().any(|rule| {
+            rule.ports.as_ref().map_or(false, |ports| {
+                ports.iter().any(|p| p.port.as_ref().map_or(false, |v| v == &k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(53)))
+            })
+        });
+        assert!(has_dns, "must have DNS egress rule");
+        
+        // 2. Peer egress
+        let has_peers = egress.iter().any(|rule| {
+            rule.to.as_ref().map_or(false, |to| {
+                to.iter().any(|p| {
+                    p.ip_block.as_ref().map_or(false, |ip| ip.cidr == "1.2.3.4/32" || ip.cidr == "5.6.7.8/32")
+                })
+            })
+        });
+        assert!(has_peers, "must have peer egress rule for IPs 1.2.3.4 and 5.6.7.8");
     }
 }

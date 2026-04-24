@@ -40,31 +40,37 @@ use kube::{
     Resource, ResourceExt,
 };
 use tracing::{debug, error, info, info_span, instrument, warn};
+use tracing_subscriber::{reload::Handle, EnvFilter, Registry};
 
 use crate::crd::{
-    DisasterRecoveryStatus, NodeType, RolloutStrategy, SpecValidationError, StellarNode,
+    Condition, DisasterRecoveryStatus, NodeType, SpecValidationError, StellarNode,
     StellarNodeStatus,
 };
 use crate::error::{Error, Result};
 use crate::infra;
 
 use super::archive_health::{
-    calculate_backoff, check_archive_integrity, check_history_archive_health, ArchiveHealthResult,
+    calculate_backoff, check_archive_integrity, check_archive_integrity_random,
+    check_history_archive_health, ArchiveHealthResult, ArchiveIntegrityCheckResult,
     ARCHIVE_LAG_THRESHOLD,
 };
 use super::conditions;
+use super::cross_cloud_failover;
 use super::cve_reconciler;
 use super::dr;
 use super::dr_drill;
 use super::finalizers::STELLAR_NODE_FINALIZER;
 use super::health;
 use super::kms_secret;
+use super::label_propagation::LabelPropagator;
+use super::maintenance;
 #[cfg(feature = "metrics")]
 use super::metrics;
 use super::mtls;
 use super::oci_snapshot;
 use super::operator_config::{hardcoded_defaults, OperatorConfig};
 use super::peer_discovery;
+use super::pss;
 use super::remediation;
 use super::resources;
 use super::service_mesh;
@@ -98,6 +104,13 @@ pub struct ControllerState {
     pub reconcile_id_counter: std::sync::atomic::AtomicU64,
     /// Timestamp of the last successful reconcile
     pub last_reconcile_success: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Handle to reload the tracing filter
+    pub log_reload_handle: Handle<EnvFilter, Registry>,
+    /// Optional expiration time for a temporary log level change
+    pub log_level_expires_at:
+        std::sync::Arc<tokio::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+    /// Timestamp of the last event received from the K8s watch stream
+    pub last_event_received: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ControllerState {
@@ -136,12 +149,14 @@ impl ControllerState {
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     let client = Client::try_default().await?;
+///     let env_filter = tracing_subscriber::EnvFilter::from_default_env();
+///     let (_layer, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
 ///     let state = Arc::new(ControllerState {
 ///         client,
 ///         enable_mtls: false,
-///         mtls_config: None,
 ///         operator_namespace: "stellar-operator".to_string(),
 ///         watch_namespace: None,
+///         mtls_config: None,
 ///         dry_run: false,
 ///         is_leader: Arc::new(AtomicBool::new(true)),
 ///         event_reporter: kube::runtime::events::Reporter {
@@ -151,6 +166,9 @@ impl ControllerState {
 ///         operator_config: Arc::new(Default::default()),
 ///         reconcile_id_counter: AtomicU64::new(0),
 ///         last_reconcile_success: Arc::new(AtomicU64::new(0)),
+///         log_reload_handle: reload_handle,
+///         log_level_expires_at: Arc::new(tokio::sync::Mutex::new(None)),
+///         last_event_received: Arc::new(AtomicU64::new(0)),
 ///     });
 ///     run_controller(state).await?;
 ///     Ok(())
@@ -166,11 +184,8 @@ pub async fn run_controller(state: Arc<ControllerState>) -> Result<()> {
 
     info!(
         "Starting StellarNode controller (mode: {})",
-        if state.watch_namespace.is_some() {
-            format!(
-                "namespace-scoped: {}",
-                state.watch_namespace.as_ref().unwrap()
-            )
+        if let Some(ns) = &state.watch_namespace {
+            format!("namespace-scoped: {ns}")
         } else {
             "cluster-scoped".to_string()
         }
@@ -189,6 +204,28 @@ pub async fn run_controller(state: Arc<ControllerState>) -> Result<()> {
             ));
         }
     }
+
+    // Start Node Drain Orchestrator in the background
+    let drain_orchestrator = Arc::new(maintenance::NodeDrainOrchestrator::new(
+        client.clone(),
+        state.event_reporter.clone(),
+    ));
+    tokio::spawn(async move {
+        if let Err(e) = drain_orchestrator.run().await {
+            error!("Node Drain Orchestrator stopped with error: {}", e);
+        }
+    });
+
+    // Start Quorum Optimizer in the background
+    let quorum_optimizer = Arc::new(quorum::QuorumOptimizer::new(
+        client.clone(),
+        state.event_reporter.clone(),
+    ));
+    tokio::spawn(async move {
+        if let Err(e) = quorum_optimizer.run().await {
+            error!("Quorum Optimizer stopped with error: {}", e);
+        }
+    });
 
     Controller::new(stellar_nodes, Config::default())
         // Watch owned resources for changes
@@ -233,7 +270,19 @@ pub async fn run_controller(state: Arc<ControllerState>) -> Result<()> {
             Config::default(),
         )
         .shutdown_on_signal()
-        .run(reconcile, error_policy, state)
+        .run(reconcile, error_policy, state.clone())
+        .inspect({
+            let state = state.clone();
+            move |_| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                state
+                    .last_event_received
+                    .store(now, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
         .for_each(|_res| async {})
         .await;
 
@@ -547,9 +596,38 @@ pub(crate) async fn apply_stellar_node(
         return Err(Error::ValidationError(message));
     }
 
+    // Network safety check — must run before any resources are created.
+    // Ensures no Mainnet node shares a namespace with a Testnet node (or vice versa).
+    if let Err(e) = super::network_isolation::check_network_safety(client, node).await {
+        let msg = e.to_string();
+        warn!("Network safety check failed for {}/{}: {}", namespace, name, msg);
+        emit_event(
+            client,
+            &ctx.event_reporter,
+            node,
+            kube::runtime::events::EventType::Warning,
+            "NetworkSafetyViolation",
+            "NetworkIsolation",
+            &msg,
+        )
+        .await?;
+        update_status(client, node, "Failed", Some(&msg), 0, true).await?;
+        return Err(e);
+    }
+
+    let propagated_labels = LabelPropagator::new(node).compute();
+
+    // Enforce PSS 'restricted' on the managed namespace (idempotent)
+    if let Err(e) = pss::ensure_namespace_pss_labels(client, &namespace).await {
+        warn!(
+            "Failed to apply PSS labels to namespace '{}': {}. Continuing reconciliation.",
+            namespace, e
+        );
+    }
+
     // 1. Core infrastructure (PVC and ConfigMap) always managed by operator
     apply_or_emit(ctx, node, ActionType::Update, "PVC and ConfigMap", async {
-        resources::ensure_pvc(client, node, ctx.dry_run).await?;
+        resources::ensure_pvc(client, node, &propagated_labels, ctx.dry_run).await?;
         resources::ensure_config_map(client, node, None, ctx.enable_mtls, ctx.dry_run).await?;
         Ok(())
     })
@@ -571,7 +649,7 @@ pub(crate) async fn apply_stellar_node(
             ActionType::Update,
             "Suspended state resources",
             async {
-                resources::ensure_pvc(client, node, ctx.dry_run).await?;
+                resources::ensure_pvc(client, node, &propagated_labels, ctx.dry_run).await?;
                 resources::ensure_config_map(client, node, None, ctx.enable_mtls, ctx.dry_run)
                     .await?;
 
@@ -583,17 +661,31 @@ pub(crate) async fn apply_stellar_node(
                             node,
                             ctx.enable_mtls,
                             None,
+                            &propagated_labels,
                             ctx.dry_run,
                         )
                         .await?;
                     }
                     NodeType::Horizon | NodeType::SorobanRpc => {
-                        resources::ensure_deployment(client, node, ctx.enable_mtls, ctx.dry_run)
-                            .await?;
+                        resources::ensure_deployment(
+                            client,
+                            node,
+                            ctx.enable_mtls,
+                            &propagated_labels,
+                            ctx.dry_run,
+                        )
+                        .await?;
                     }
                 }
 
-                resources::ensure_service(client, node, ctx.enable_mtls, ctx.dry_run).await?;
+                resources::ensure_service(
+                    client,
+                    node,
+                    ctx.enable_mtls,
+                    &propagated_labels,
+                    ctx.dry_run,
+                )
+                .await?;
                 Ok(())
             },
         )
@@ -807,6 +899,58 @@ pub(crate) async fn apply_stellar_node(
                     }
                 }
             }
+
+            // Automatic checkpoint integrity checks are configured under DR config.
+            if let Some(archive_config) = node
+                .spec
+                .dr_config
+                .as_ref()
+                .and_then(|dr| dr.archive_integrity_config.as_ref())
+            {
+                if archive_config.enabled && !validator_config.history_archive_urls.is_empty() {
+                    let interval = match parse_duration(&archive_config.interval) {
+                        Ok(d) => d,
+                        Err(_) => Duration::from_secs(21600), // Default 6h
+                    };
+
+                    let last_check_time = node
+                        .status
+                        .as_ref()
+                        .and_then(|s| {
+                            s.conditions
+                                .iter()
+                                .find(|c| c.type_ == "ArchiveIntegrityCheck")
+                                .map(|c| c.last_transition_time.clone())
+                        })
+                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc));
+
+                    let should_run = match last_check_time {
+                        None => true,
+                        Some(last) => {
+                            let age = chrono::Utc::now() - last;
+                            age.to_std().unwrap_or(Duration::from_secs(0)) >= interval
+                        }
+                    };
+
+                    if should_run {
+                        if let Err(e) = run_archive_checkpoint_verification(
+                            client,
+                            &ctx.event_reporter,
+                            node,
+                            &validator_config.history_archive_urls,
+                            archive_config,
+                        )
+                        .await
+                        {
+                            warn!(
+                                "Archive checkpoint verification error for {}/{}: {}",
+                                namespace, name, e
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -827,7 +971,7 @@ pub(crate) async fn apply_stellar_node(
 
     // 1. Create/update the PersistentVolumeClaim
     apply_or_emit(ctx, node, ActionType::Create, "PVC", async {
-        resources::ensure_pvc(client, node, ctx.dry_run).await?;
+        resources::ensure_pvc(client, node, &propagated_labels, ctx.dry_run).await?;
         Ok(())
     })
     .await?;
@@ -912,7 +1056,7 @@ pub(crate) async fn apply_stellar_node(
         .unwrap_or(false);
 
     // 5. Create/update the Deployment/StatefulSet based on node type
-    apply_or_emit(
+    let workload_result = apply_or_emit(
         ctx,
         node,
         ActionType::Update,
@@ -948,6 +1092,7 @@ pub(crate) async fn apply_stellar_node(
                         node,
                         ctx.enable_mtls,
                         seed_injection.as_ref(),
+                        &propagated_labels,
                         ctx.dry_run,
                     )
                     .await?;
@@ -961,7 +1106,7 @@ pub(crate) async fn apply_stellar_node(
                 }
                 NodeType::Horizon | NodeType::SorobanRpc => {
                     // Handle Canary Deployment
-                    if let RolloutStrategy::Canary(cfg) = &node.spec.strategy {
+                    if let Some(cfg) = node.spec.strategy.canary() {
                         // Determine if we are in a canary state
                         let current_version = get_current_deployment_version(client, node).await?;
 
@@ -1015,7 +1160,7 @@ pub(crate) async fn apply_stellar_node(
                             if let Some(cv) = &current_version {
                                 stable_node.spec.version = cv.clone();
                             }
-                            resources::ensure_deployment(client, &stable_node, ctx.enable_mtls, ctx.dry_run).await?;
+                            resources::ensure_deployment(client, &stable_node, ctx.enable_mtls, &propagated_labels, ctx.dry_run).await?;
 
                             // Check if the canary interval has elapsed
                             if let Some(status) = &node.status {
@@ -1037,7 +1182,7 @@ pub(crate) async fn apply_stellar_node(
                                             if canary_health.healthy {
                                                 // 4a. Promote Canary
                                                 info!("Canary {}/{} is healthy. Promoting to stable.", namespace, name);
-                                                resources::ensure_deployment(client, node, ctx.enable_mtls, ctx.dry_run).await?;
+                                                resources::ensure_deployment(client, node, ctx.enable_mtls, &propagated_labels, ctx.dry_run).await?;
                                                 resources::delete_canary_resources(client, node, ctx.dry_run).await?;
 
                                                 let patch = serde_json::json!({
@@ -1093,12 +1238,12 @@ pub(crate) async fn apply_stellar_node(
                             }
                         } else {
                             // No canary active, regular deployment ensure
-                            resources::ensure_deployment(client, node, ctx.enable_mtls, ctx.dry_run).await?;
+                            resources::ensure_deployment(client, node, ctx.enable_mtls, &propagated_labels, ctx.dry_run).await?;
                             resources::delete_canary_resources(client, node, ctx.dry_run).await?;
                         }
                     } else {
                         // RPC nodes use Deployment
-                        resources::ensure_deployment(client, node, ctx.enable_mtls, ctx.dry_run).await?;
+                        resources::ensure_deployment(client, node, ctx.enable_mtls, &propagated_labels, ctx.dry_run).await?;
                         info!("Deployment ensured for RPC node {}/{}", namespace, name);
 
                         // Clean up canary resources if they exist
@@ -1109,7 +1254,48 @@ pub(crate) async fn apply_stellar_node(
             Ok(())
         },
     )
-    .await?;
+    .await;
+
+    // 5.3: Handle workload failure — emit LabelPropagationFailed warning event and patch status
+    match workload_result {
+        Ok(()) => {}
+        Err(workload_err) => {
+            if let Err(e) = publish_stellar_event(
+                client,
+                &ctx.event_reporter,
+                node,
+                EventType::Warning,
+                "LabelPropagationFailed",
+                "LabelPropagation",
+                &format!("Label propagation failed for workload: {workload_err}"),
+            )
+            .await
+            {
+                warn!("Failed to publish LabelPropagationFailed event: {}", e);
+            }
+            {
+                let api: Api<StellarNode> = Api::namespaced(client.clone(), &namespace);
+                let patch = serde_json::json!({
+                    "status": {
+                        "labelPropagationStatus": "Failed"
+                    }
+                });
+                if let Err(e) = api
+                    .patch_status(
+                        &name,
+                        &PatchParams::apply("stellar-operator"),
+                        &Patch::Merge(&patch),
+                    )
+                    .await
+                {
+                    warn!("Failed to patch labelPropagationStatus to Failed: {}", e);
+                }
+            }
+            return Err(workload_err);
+        }
+    }
+
+    // Workload block succeeded — continue with observability
 
     if !ctx.dry_run {
         let workload_exists_after = workload_resource_exists(client, node).await.unwrap_or(true);
@@ -1126,6 +1312,65 @@ pub(crate) async fn apply_stellar_node(
             {
                 warn!("Failed to publish SuccessfulReconciliation event: {e}");
             }
+        }
+    }
+
+    // 5.2 / 5.4: Emit LabelsPropagated event and patch labelPropagationStatus to Synced
+    if let Err(e) = publish_stellar_event(
+        client,
+        &ctx.event_reporter,
+        node,
+        EventType::Normal,
+        "LabelsPropagated",
+        "LabelPropagation",
+        "Labels propagated to child resources",
+    )
+    .await
+    {
+        warn!("Failed to publish LabelsPropagated event: {}", e);
+    }
+
+    // 5.2: Emit LabelRemoved event when a generation change indicates labels may have been removed
+    {
+        let current_gen = node.metadata.generation.unwrap_or(0);
+        let observed_gen = node
+            .status
+            .as_ref()
+            .and_then(|s| s.observed_generation)
+            .unwrap_or(0);
+        if current_gen > observed_gen {
+            if let Err(e) = publish_stellar_event(
+                client,
+                &ctx.event_reporter,
+                node,
+                EventType::Normal,
+                "LabelRemoved",
+                "LabelPropagation",
+                "Stale labels removed from child resources",
+            )
+            .await
+            {
+                warn!("Failed to publish LabelRemoved event: {}", e);
+            }
+        }
+    }
+
+    {
+        let api: Api<StellarNode> = Api::namespaced(client.clone(), &namespace);
+        let patch = serde_json::json!({
+            "status": {
+                "labelPropagationStatus": "Synced"
+            }
+        });
+        if let Err(e) = api
+            .patch_status(
+                &name,
+                &PatchParams::apply("stellar-operator"),
+                &Patch::Merge(&patch),
+            )
+            .await
+        {
+            warn!("Failed to patch labelPropagationStatus: {}", e);
         }
     }
 
@@ -1338,6 +1583,79 @@ pub(crate) async fn apply_stellar_node(
         .await?;
     }
 
+    // 8b. Cross-cloud failover for Horizon/SorobanRpc nodes
+    if node
+        .spec
+        .cross_cloud_failover
+        .as_ref()
+        .map(|c| c.enabled)
+        .unwrap_or(false)
+    {
+        let prev_cc_failover = node
+            .status
+            .as_ref()
+            .and_then(|s| s.cross_cloud_failover_status.as_ref())
+            .map(|s| s.failover_active)
+            .unwrap_or(false);
+
+        match cross_cloud_failover::reconcile_cross_cloud_failover(client, node).await {
+            Ok(Some(cc_status)) => {
+                if cc_status.failover_active && !prev_cc_failover {
+                    let recorder = recorder_for(client, &ctx.event_reporter, node);
+                    if let Err(e) = publish_object_event(
+                        &recorder,
+                        EventType::Normal,
+                        "CrossCloudFailoverActivated",
+                        "CrossCloudFailover",
+                        &format!(
+                            "Cross-cloud failover activated. Traffic routed to: {}",
+                            cc_status.active_cloud.as_deref().unwrap_or("unknown")
+                        ),
+                    )
+                    .await
+                    {
+                        warn!("Failed to publish CrossCloudFailoverActivated event: {e}");
+                    }
+                } else if !cc_status.failover_active && prev_cc_failover {
+                    let recorder = recorder_for(client, &ctx.event_reporter, node);
+                    if let Err(e) = publish_object_event(
+                        &recorder,
+                        EventType::Normal,
+                        "CrossCloudFailbackCompleted",
+                        "CrossCloudFailover",
+                        &format!(
+                            "Cross-cloud failback completed. Traffic restored to: {}",
+                            cc_status.active_cloud.as_deref().unwrap_or("primary")
+                        ),
+                    )
+                    .await
+                    {
+                        warn!("Failed to publish CrossCloudFailbackCompleted event: {e}");
+                    }
+                }
+
+                apply_or_emit(
+                    ctx,
+                    node,
+                    ActionType::Update,
+                    "Status (Cross-Cloud Failover)",
+                    async {
+                        update_cross_cloud_failover_status(client, node, cc_status).await?;
+                        Ok(())
+                    },
+                )
+                .await?;
+            }
+            Ok(None) => {} // Not configured or not applicable
+            Err(e) => {
+                warn!(
+                    "Cross-cloud failover reconciliation failed for {}/{}: {}",
+                    namespace, name, e
+                );
+            }
+        }
+    }
+
     // 9. Auto-remediation check
     if health_result.healthy && !node.spec.suspended {
         let stale_check = remediation::check_stale_node(node, health_result.ledger_sequence);
@@ -1453,7 +1771,7 @@ pub(crate) async fn apply_stellar_node(
                 &namespace,
                 &name,
                 &node.spec.node_type.to_string(),
-                node.spec.network.passphrase(),
+                node.spec.network_passphrase(),
                 &hardware_generation,
                 seq,
             );
@@ -1467,12 +1785,36 @@ pub(crate) async fn apply_stellar_node(
                     &namespace,
                     &name,
                     &node.spec.node_type.to_string(),
-                    node.spec.network.passphrase(),
+                    node.spec.network_passphrase(),
                     &hardware_generation,
                     lag.max(0),
                 );
             }
         }
+    }
+
+    // 10b. Update node sync status metric
+    #[cfg(feature = "metrics")]
+    {
+        let hardware_generation = hardware_generation_for_metrics(client, node).await;
+        metrics::set_node_sync_status(
+            &namespace,
+            &name,
+            &node.spec.node_type.to_string(),
+            node.spec.network_passphrase(),
+            &hardware_generation,
+            phase,
+        );
+
+        // 10c. Update node up status based on pod readiness
+        metrics::set_node_up(
+            &namespace,
+            &name,
+            &node.spec.node_type.to_string(),
+            node.spec.network_passphrase(),
+            &hardware_generation,
+            health_result.healthy,
+        );
     }
 
     // 11. OCI snapshot push/pull Jobs
@@ -1930,6 +2272,177 @@ async fn update_suspended_status(client: &Client, node: &StellarNode) -> Result<
 }
 
 /// Update the status subresource of a StellarNode using Kubernetes conditions pattern
+pub(crate) fn apply_phase_conditions(
+    conditions: &mut Vec<Condition>,
+    phase: &str,
+    message: Option<&str>,
+) {
+    match phase {
+        "Ready" => {
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_READY,
+                conditions::CONDITION_STATUS_TRUE,
+                "AllSubresourcesHealthy",
+                message.unwrap_or("All sub-resources are healthy and operational"),
+            );
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_PROGRESSING,
+                conditions::CONDITION_STATUS_FALSE,
+                "ReconcileComplete",
+                "Reconciliation completed successfully",
+            );
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_DEGRADED,
+                conditions::CONDITION_STATUS_FALSE,
+                "NoIssues",
+                "No degradation detected",
+            );
+        }
+        "Creating" | "Pending" => {
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_READY,
+                conditions::CONDITION_STATUS_FALSE,
+                "Creating",
+                message.unwrap_or("Resources are being created"),
+            );
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_PROGRESSING,
+                conditions::CONDITION_STATUS_TRUE,
+                "Creating",
+                message.unwrap_or("Creating resources"),
+            );
+            conditions::remove_condition(conditions, conditions::CONDITION_TYPE_DEGRADED);
+        }
+        "Syncing" => {
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_READY,
+                conditions::CONDITION_STATUS_FALSE,
+                "Syncing",
+                message.unwrap_or("Node is syncing with the network"),
+            );
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_PROGRESSING,
+                conditions::CONDITION_STATUS_TRUE,
+                "Syncing",
+                message.unwrap_or("Syncing data"),
+            );
+            conditions::remove_condition(conditions, conditions::CONDITION_TYPE_DEGRADED);
+        }
+        "Running" => {
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_READY,
+                conditions::CONDITION_STATUS_TRUE,
+                "ResourcesCreated",
+                message.unwrap_or("Resources created successfully"),
+            );
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_PROGRESSING,
+                conditions::CONDITION_STATUS_FALSE,
+                "Complete",
+                "Resource creation complete",
+            );
+            conditions::remove_condition(conditions, conditions::CONDITION_TYPE_DEGRADED);
+        }
+        "Degraded" => {
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_READY,
+                conditions::CONDITION_STATUS_FALSE,
+                "Degraded",
+                message.unwrap_or("Node is experiencing issues"),
+            );
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_DEGRADED,
+                conditions::CONDITION_STATUS_TRUE,
+                "IssuesDetected",
+                message.unwrap_or("Node is degraded"),
+            );
+            conditions::remove_condition(conditions, conditions::CONDITION_TYPE_PROGRESSING);
+        }
+        "Failed" => {
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_READY,
+                conditions::CONDITION_STATUS_FALSE,
+                "Failed",
+                message.unwrap_or("Node operation failed"),
+            );
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_DEGRADED,
+                conditions::CONDITION_STATUS_TRUE,
+                "Failed",
+                message.unwrap_or("Operation failed"),
+            );
+            conditions::remove_condition(conditions, conditions::CONDITION_TYPE_PROGRESSING);
+        }
+        "Remediating" => {
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_READY,
+                conditions::CONDITION_STATUS_FALSE,
+                "Remediating",
+                message.unwrap_or("Auto-remediation in progress"),
+            );
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_PROGRESSING,
+                conditions::CONDITION_STATUS_TRUE,
+                "Remediating",
+                message.unwrap_or("Remediation in progress"),
+            );
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_DEGRADED,
+                conditions::CONDITION_STATUS_TRUE,
+                "Remediating",
+                "Node required remediation",
+            );
+        }
+        "Suspended" => {
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_READY,
+                conditions::CONDITION_STATUS_FALSE,
+                "Suspended",
+                message.unwrap_or("Node is suspended"),
+            );
+            conditions::remove_condition(conditions, conditions::CONDITION_TYPE_PROGRESSING);
+            conditions::remove_condition(conditions, conditions::CONDITION_TYPE_DEGRADED);
+        }
+        "Maintenance" => {
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_READY,
+                conditions::CONDITION_STATUS_FALSE,
+                "Maintenance",
+                message.unwrap_or("Node is in maintenance mode"),
+            );
+            conditions::remove_condition(conditions, conditions::CONDITION_TYPE_PROGRESSING);
+            conditions::remove_condition(conditions, conditions::CONDITION_TYPE_DEGRADED);
+        }
+        _ => {
+            conditions::set_condition(
+                conditions,
+                conditions::CONDITION_TYPE_READY,
+                conditions::CONDITION_STATUS_UNKNOWN,
+                "Unknown",
+                message.unwrap_or("Status unknown"),
+            );
+        }
+    }
+}
+
 #[allow(deprecated)]
 #[instrument(skip(client, node, message), fields(name = %node.name_any(), namespace = node.namespace(), phase))]
 async fn update_status(
@@ -1958,171 +2471,7 @@ async fn update_status(
         .map(|s| s.conditions.clone())
         .unwrap_or_default();
 
-    // Map phase to conditions
-    match phase {
-        "Ready" => {
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_READY,
-                conditions::CONDITION_STATUS_TRUE,
-                "AllSubresourcesHealthy",
-                message.unwrap_or("All sub-resources are healthy and operational"),
-            );
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_PROGRESSING,
-                conditions::CONDITION_STATUS_FALSE,
-                "ReconcileComplete",
-                "Reconciliation completed successfully",
-            );
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_DEGRADED,
-                conditions::CONDITION_STATUS_FALSE,
-                "NoIssues",
-                "No degradation detected",
-            );
-        }
-        "Creating" | "Pending" => {
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_READY,
-                conditions::CONDITION_STATUS_FALSE,
-                "Creating",
-                message.unwrap_or("Resources are being created"),
-            );
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_PROGRESSING,
-                conditions::CONDITION_STATUS_TRUE,
-                "Creating",
-                message.unwrap_or("Creating resources"),
-            );
-            conditions::remove_condition(&mut conditions, conditions::CONDITION_TYPE_DEGRADED);
-        }
-        "Syncing" => {
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_READY,
-                conditions::CONDITION_STATUS_FALSE,
-                "Syncing",
-                message.unwrap_or("Node is syncing with the network"),
-            );
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_PROGRESSING,
-                conditions::CONDITION_STATUS_TRUE,
-                "Syncing",
-                message.unwrap_or("Syncing data"),
-            );
-            conditions::remove_condition(&mut conditions, conditions::CONDITION_TYPE_DEGRADED);
-        }
-        "Running" => {
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_READY,
-                conditions::CONDITION_STATUS_TRUE,
-                "ResourcesCreated",
-                message.unwrap_or("Resources created successfully"),
-            );
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_PROGRESSING,
-                conditions::CONDITION_STATUS_FALSE,
-                "Complete",
-                "Resource creation complete",
-            );
-            conditions::remove_condition(&mut conditions, conditions::CONDITION_TYPE_DEGRADED);
-        }
-        "Degraded" => {
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_READY,
-                conditions::CONDITION_STATUS_FALSE,
-                "Degraded",
-                message.unwrap_or("Node is experiencing issues"),
-            );
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_DEGRADED,
-                conditions::CONDITION_STATUS_TRUE,
-                "IssuesDetected",
-                message.unwrap_or("Node is degraded"),
-            );
-            conditions::remove_condition(&mut conditions, conditions::CONDITION_TYPE_PROGRESSING);
-        }
-        "Failed" => {
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_READY,
-                conditions::CONDITION_STATUS_FALSE,
-                "Failed",
-                message.unwrap_or("Node operation failed"),
-            );
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_DEGRADED,
-                conditions::CONDITION_STATUS_TRUE,
-                "Failed",
-                message.unwrap_or("Operation failed"),
-            );
-            conditions::remove_condition(&mut conditions, conditions::CONDITION_TYPE_PROGRESSING);
-        }
-        "Remediating" => {
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_READY,
-                conditions::CONDITION_STATUS_FALSE,
-                "Remediating",
-                message.unwrap_or("Auto-remediation in progress"),
-            );
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_PROGRESSING,
-                conditions::CONDITION_STATUS_TRUE,
-                "Remediating",
-                message.unwrap_or("Remediation in progress"),
-            );
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_DEGRADED,
-                conditions::CONDITION_STATUS_TRUE,
-                "Remediating",
-                "Node required remediation",
-            );
-        }
-        "Suspended" => {
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_READY,
-                conditions::CONDITION_STATUS_FALSE,
-                "Suspended",
-                message.unwrap_or("Node is suspended"),
-            );
-            conditions::remove_condition(&mut conditions, conditions::CONDITION_TYPE_PROGRESSING);
-            conditions::remove_condition(&mut conditions, conditions::CONDITION_TYPE_DEGRADED);
-        }
-        "Maintenance" => {
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_READY,
-                conditions::CONDITION_STATUS_FALSE,
-                "Maintenance",
-                message.unwrap_or("Node is in maintenance mode"),
-            );
-            conditions::remove_condition(&mut conditions, conditions::CONDITION_TYPE_PROGRESSING);
-            conditions::remove_condition(&mut conditions, conditions::CONDITION_TYPE_DEGRADED);
-        }
-        _ => {
-            conditions::set_condition(
-                &mut conditions,
-                conditions::CONDITION_TYPE_READY,
-                conditions::CONDITION_STATUS_UNKNOWN,
-                "Unknown",
-                message.unwrap_or("Status unknown"),
-            );
-        }
-    }
+    apply_phase_conditions(&mut conditions, phase, message);
 
     // Set observed generation on all conditions
     if let Some(gen) = observed_generation {
@@ -2218,7 +2567,7 @@ async fn run_archive_integrity_check(
         &namespace,
         &name,
         &node.spec.node_type.to_string(),
-        node.spec.network.passphrase(),
+        node.spec.network_passphrase(),
         &hardware_generation,
         max_lag as i64,
     );
@@ -2508,6 +2857,171 @@ async fn update_status_with_canary(
     Ok(())
 }
 
+/// Run the archive checkpoint verification check
+async fn run_archive_checkpoint_verification(
+    client: &Client,
+    reporter: &Reporter,
+    node: &StellarNode,
+    urls: &[String],
+    config: &crate::crd::ArchiveIntegrityConfig,
+) -> Result<()> {
+    let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
+    let name = node.name_any();
+    let api: Api<StellarNode> = Api::namespaced(client.clone(), &namespace);
+
+    info!(
+        "Running archive checkpoint integrity check for {}/{}",
+        namespace, name
+    );
+
+    let mut results = Vec::new();
+    for url in urls {
+        match check_archive_integrity_random(
+            url,
+            config.check_percentage,
+            config.max_checkpoints,
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(res) => results.push(res),
+            Err(e) => {
+                warn!("Archive integrity check failed for {}: {}", url, e);
+                results.push(ArchiveIntegrityCheckResult {
+                    url: url.clone(),
+                    healthy: false,
+                    checkpoints_verified: 0,
+                    message: format!("Check failed: {e}"),
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+
+    let all_healthy = results.iter().all(|r| r.healthy);
+    let summary = if all_healthy {
+        format!(
+            "Archive integrity verified: {} archives healthy",
+            results.len()
+        )
+    } else {
+        let failed = results.iter().filter(|r| !r.healthy).count();
+        format!(
+            "Archive integrity corruption detected: {}/{} archives corrupted",
+            failed,
+            results.len()
+        )
+    };
+
+    // Update metrics
+    let node_type = format!("{:?}", node.spec.node_type);
+    let network = format!("{:?}", node.spec.network);
+    let hardware = hardware_generation_for_metrics(client, node).await;
+    metrics::set_archive_integrity_status(
+        &namespace,
+        &name,
+        &node_type,
+        &network,
+        &hardware,
+        all_healthy,
+    );
+
+    // Update status conditions
+    let mut status = node.status.clone().unwrap_or_default();
+    if all_healthy {
+        conditions::set_condition(
+            &mut status.conditions,
+            "ArchiveIntegrityCheck",
+            conditions::CONDITION_STATUS_TRUE,
+            "IntegrityVerified",
+            &summary,
+        );
+        conditions::remove_condition(&mut status.conditions, "ArchiveIntegrityCorrupted");
+    } else {
+        conditions::set_condition(
+            &mut status.conditions,
+            "ArchiveIntegrityCheck",
+            conditions::CONDITION_STATUS_FALSE,
+            "IntegrityCheckFailed",
+            &summary,
+        );
+        conditions::set_condition(
+            &mut status.conditions,
+            "ArchiveIntegrityCorrupted",
+            conditions::CONDITION_STATUS_TRUE,
+            "CorruptionDetected",
+            &summary,
+        );
+
+        // Emit Fatal Event for corruption
+        publish_stellar_event(
+            client,
+            reporter,
+            node,
+            EventType::Warning,
+            "ArchiveIntegrityCorruption",
+            "ArchiveIntegrity",
+            &format!(
+                "FATAL: Corruption detected in history archives!\n\nDetails:\n{}",
+                results
+                    .iter()
+                    .filter(|r| !r.healthy)
+                    .map(|r| format!("- {}: {}", r.url, r.message))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )
+        .await?;
+    }
+
+    // Set observed generation
+    if let Some(gen) = node.metadata.generation {
+        for condition in &mut status.conditions {
+            if condition.type_ == "ArchiveIntegrityCheck"
+                || condition.type_ == "ArchiveIntegrityCorrupted"
+            {
+                condition.observed_generation = Some(gen);
+            }
+        }
+    }
+
+    let patch = serde_json::json!({ "status": status });
+    api.patch_status(
+        &name,
+        &PatchParams::apply("stellar-operator"),
+        &Patch::Merge(&patch),
+    )
+    .await
+    .map_err(Error::KubeError)?;
+
+    Ok(())
+}
+
+/// Helper to parse duration string (e.g. "1h", "6h", "24h")
+fn parse_duration(s: &str) -> Result<Duration> {
+    let s = s.trim();
+    if let Some(h) = s.strip_suffix('h') {
+        let hours = h
+            .parse::<u64>()
+            .map_err(|_| Error::ConfigError(format!("Invalid duration: {s}")))?;
+        Ok(Duration::from_secs(hours * 3600))
+    } else if let Some(m) = s.strip_suffix('m') {
+        let mins = m
+            .parse::<u64>()
+            .map_err(|_| Error::ConfigError(format!("Invalid duration: {s}")))?;
+        Ok(Duration::from_secs(mins * 60))
+    } else if let Some(sec) = s.strip_suffix('s') {
+        let secs = sec
+            .parse::<u64>()
+            .map_err(|_| Error::ConfigError(format!("Invalid duration: {s}")))?;
+        Ok(Duration::from_secs(secs))
+    } else {
+        Err(Error::ConfigError(format!(
+            "Unsupported duration format: {s}"
+        )))
+    }
+}
+
 /// Helper to get the latest ledger from the Stellar network
 async fn get_latest_network_ledger(network: &crate::crd::StellarNetwork) -> Result<u64> {
     let url = match network {
@@ -2558,6 +3072,41 @@ async fn update_dr_status(
     .map_err(Error::KubeError)?;
 
     Ok(())
+}
+
+async fn update_cross_cloud_failover_status(
+    client: &Client,
+    node: &StellarNode,
+    status: crate::crd::CrossCloudFailoverStatus,
+) -> Result<()> {
+    let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
+    let api: Api<StellarNode> = Api::namespaced(client.clone(), &namespace);
+
+    let patch = serde_json::json!({
+        "status": {
+            "crossCloudFailoverStatus": status
+        }
+    });
+
+    api.patch_status(
+        &node.name_any(),
+        &PatchParams::apply("stellar-operator"),
+        &Patch::Merge(&patch),
+    )
+    .await
+    .map_err(Error::KubeError)?;
+
+    Ok(())
+}
+
+/// Public entry point for state-machine fuzzing. Calls the same reconcile logic as the controller.
+/// Only compiled when the `reconciler-fuzz` feature is enabled.
+#[cfg(feature = "reconciler-fuzz")]
+pub async fn reconcile_for_fuzz(
+    obj: Arc<StellarNode>,
+    ctx: Arc<ControllerState>,
+) -> Result<Action> {
+    reconcile(obj, ctx).await
 }
 
 /// Error policy determines how to handle reconciliation errors

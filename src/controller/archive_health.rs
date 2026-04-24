@@ -10,6 +10,11 @@ use serde::Deserialize;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+pub use archive_checker::{check_archive_integrity_random, ArchiveIntegrityCheckResult};
+
+#[path = "archive_checker.rs"]
+mod archive_checker;
+
 /// Result of checking multiple history archive URLs
 #[derive(Debug, Clone)]
 pub struct ArchiveHealthResult {

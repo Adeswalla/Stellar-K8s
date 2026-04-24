@@ -631,6 +631,27 @@ fn validate_spec_builtin(object: &serde_json::Value) -> Option<ServerValidationR
             });
         }
     };
+
+    // PSS 'restricted' bypass check — runs before spec validation so security
+    // violations are surfaced with a clear, actionable message.
+    let pss_violations = crate::controller::pss::validate_pss_compliance(&node.spec);
+    if !pss_violations.is_empty() {
+        let message = pss_violations
+            .iter()
+            .map(|v| format!("{}: {}", v.field, v.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Some(ServerValidationResult {
+            allowed: false,
+            message: Some(format!(
+                "PSS 'restricted' violation(s) detected — zero-trust policy forbids these settings: {message}"
+            )),
+            warnings: vec![],
+            plugin_results: vec![],
+            total_execution_time_ms: 0,
+        });
+    }
+
     let errors = node.spec.validate().err()?;
     let message = errors
         .iter()
@@ -759,7 +780,7 @@ mod tests {
             "metadata": { "name": "my-validator", "namespace": "default" },
             "spec": {
                 "nodeType": "Validator",
-                "network": "Testnet",
+                "network": "testnet",
                 "version": "v21.0.0",
                 "replicas": 1,
                 "validatorConfig": {
@@ -789,7 +810,7 @@ mod tests {
             "metadata": { "name": "bad", "namespace": "default" },
             "spec": {
                 "nodeType": "InvalidType",
-                "network": "Testnet",
+                "network": "testnet",
                 "version": "v21.0.0"
             }
         });
@@ -817,7 +838,7 @@ mod tests {
             "metadata": { "name": "no-config", "namespace": "default" },
             "spec": {
                 "nodeType": "Validator",
-                "network": "Testnet",
+                "network": "testnet",
                 "version": "v21.0.0",
                 "replicas": 1
             }
@@ -850,7 +871,7 @@ mod tests {
             "metadata": { "name": "my-validator", "namespace": "default" },
             "spec": {
                 "nodeType": "Validator",
-                "network": "Testnet",
+                "network": "testnet",
                 "version": "v21.0.0",
                 "replicas": 1,
                 "validatorConfig": {
@@ -913,7 +934,7 @@ mod tests {
             "metadata": { "name": "test", "namespace": "default" },
             "spec": {
                 "nodeType": "Validator",
-                "network": "Testnet",
+                "network": "testnet",
                 "version": "v21.0.0",
                 "replicas": 1,
                 "validatorConfig": {
@@ -989,7 +1010,7 @@ mod tests {
             "metadata": { "name": "test", "namespace": "default" },
             "spec": {
                 "nodeType": "Validator",
-                "network": "Testnet",
+                "network": "testnet",
                 "version": "v21.0.0",
                 "replicas": 1,
                 "validatorConfig": {

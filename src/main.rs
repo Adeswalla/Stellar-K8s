@@ -9,8 +9,11 @@ use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomRe
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 use kube::api::{Api, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::ResourceExt;
+use stellar_k8s::controller::archive_prune::{prune_archive, PruneArchiveArgs};
+use stellar_k8s::controller::diff::{diff, DiffArgs};
 use stellar_k8s::infra;
-use stellar_k8s::{controller, crd::StellarNode, preflight, Error};
+use stellar_k8s::log_scrub::ScrubLayer;
+use stellar_k8s::{controller, crd::StellarNode, incident, preflight, Error};
 use tracing::{debug, info, info_span, warn, Instrument, Level};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -44,12 +47,20 @@ enum Commands {
     Run(RunArgs),
     /// Run the admission webhook server
     Webhook(WebhookArgs),
+    /// Run the StellarBenchmark controller (can be co-located with the main operator)
+    Benchmark(BenchmarkArgs),
     /// Show version and build information
     Version,
     /// Show cluster information (node count) for a namespace
     Info(InfoArgs),
     /// Verify StellarNode CRD installation and expected version
     CheckCrd,
+    /// Prune old history archive checkpoints
+    PruneArchive(PruneArchiveArgs),
+    /// Show difference between desired and live cluster state
+    Diff(DiffArgs),
+    /// Generate a troubleshooting runbook for a StellarNode
+    GenerateRunbook(GenerateRunbookArgs),
     /// Local simulator (kind/k3s + operator + demo validators)
     Simulator(SimulatorCli),
     /// Generate shell completion scripts
@@ -58,6 +69,8 @@ enum Commands {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Generate an incident report for a specific time window
+    IncidentReport(incident::IncidentReportArgs),
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -143,19 +156,12 @@ struct RunArgs {
     scheduler_name: String,
 
     /// Print the resolved runtime configuration and exit without starting the operator.
-    ///
-    /// Loads the operator config from the path in STELLAR_OPERATOR_CONFIG (or the default
-    /// /etc/stellar-operator/config.yaml), merges it with all CLI flags and environment
-    /// variables, prints the result as YAML, and exits with code 0.
-    ///
-    /// Example: --dump-config
     #[arg(long)]
-    dump_config: bool,
+    pub dump_config: bool,
 
-    /// Run preflight checks and exit without starting the operator.
-    /// Env: PREFLIGHT_ONLY
+    /// Run preflight checks and exit without starting the operator
     #[arg(long, env = "PREFLIGHT_ONLY")]
-    preflight_only: bool,
+    pub preflight_only: bool,
 }
 
 impl RunArgs {
@@ -183,6 +189,40 @@ struct InfoArgs {
     /// Example: --namespace stellar-system
     #[arg(long, env = "OPERATOR_NAMESPACE", default_value = "default")]
     namespace: String,
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    about = "Generate a troubleshooting runbook for a StellarNode",
+    long_about = "Generates a context-aware troubleshooting runbook tailored to the specific\n\
+        configuration of a deployed StellarNode. The runbook includes:\n\n\
+        - Exact kubectl commands to fetch logs from specific containers\n\
+        - KMS key status checks if KMS is configured\n\
+        - S3/GCS CLI commands to verify archive buckets if archiving is enabled\n\
+        - Network information and expected peer connections based on quorum set\n\
+        - Resource and storage troubleshooting steps\n\n\
+        EXAMPLES:\n  \
+        stellar-operator generate-runbook my-validator -n stellar\n  \
+        stellar-operator generate-runbook my-validator -n stellar -o runbook.md\n  \
+        stellar-operator generate-runbook my-validator -n stellar | less"
+)]
+struct GenerateRunbookArgs {
+    /// Name of the StellarNode resource
+    node_name: String,
+
+    /// Kubernetes namespace containing the StellarNode
+    ///
+    /// Env: OPERATOR_NAMESPACE
+    ///
+    /// Example: --namespace stellar-system
+    #[arg(short, long, env = "OPERATOR_NAMESPACE", default_value = "default")]
+    namespace: String,
+
+    /// Output file path (optional, defaults to stdout)
+    ///
+    /// Example: --output runbook.md
+    #[arg(short, long)]
+    output: Option<String>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -283,6 +323,32 @@ struct WebhookArgs {
     log_format: LogFormat,
 }
 
+/// Arguments for the `benchmark` subcommand.
+#[derive(Parser, Debug)]
+#[command(
+    about = "Run the StellarBenchmark controller",
+    long_about = "Starts the StellarBenchmark controller that watches StellarBenchmark resources\n\
+        and reconciles them by spinning up ephemeral load-generator pods, collecting metrics,\n\
+        and writing results to BenchmarkReport resources or ConfigMaps.\n\n\
+        This controller can run standalone or be co-located with the main operator process.\n\n\
+        EXAMPLES:\n  \
+        stellar-operator benchmark\n  \
+        stellar-operator benchmark --namespace stellar-system\n  \
+        stellar-operator benchmark --log-level debug"
+)]
+struct BenchmarkArgs {
+    /// Kubernetes namespace to watch for StellarBenchmark resources.
+    ///
+    /// When unset, the controller watches all namespaces.
+    /// Env: OPERATOR_NAMESPACE
+    #[arg(long, env = "OPERATOR_NAMESPACE", default_value = "default")]
+    namespace: String,
+
+    /// Minimum log level.
+    #[arg(long, env = "LOG_LEVEL", default_value = "info")]
+    log_level: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let args = Args::parse();
@@ -311,6 +377,9 @@ async fn main() -> Result<(), Error> {
         Commands::Webhook(webhook_args) => {
             return run_webhook(webhook_args).await;
         }
+        Commands::Benchmark(benchmark_args) => {
+            return run_benchmark_controller_cmd(benchmark_args).await;
+        }
         Commands::Simulator(cli) => {
             return run_simulator(cli).await;
         }
@@ -321,6 +390,18 @@ async fn main() -> Result<(), Error> {
             let name = cmd.get_name().to_string();
             generate(shell, &mut cmd, name, &mut std::io::stdout());
             return Ok(());
+        }
+        Commands::IncidentReport(args) => {
+            return incident::run_incident_report(args).await;
+        }
+        Commands::PruneArchive(args) => {
+            return prune_archive(args).await;
+        }
+        Commands::Diff(args) => {
+            return diff(args).await;
+        }
+        Commands::GenerateRunbook(args) => {
+            return run_generate_runbook(args).await;
         }
     }
 }
@@ -708,6 +789,79 @@ async fn run_info(args: InfoArgs) -> Result<(), Error> {
     Ok(())
 }
 
+async fn run_generate_runbook(args: GenerateRunbookArgs) -> Result<(), Error> {
+    use kube::api::Api;
+    use kube::Client;
+    use stellar_k8s::runbook::generate_runbook;
+
+    // Create Kubernetes client
+    let client = Client::try_default()
+        .await
+        .map_err(|e| Error::ConfigError(format!("Failed to create Kubernetes client: {e}")))?;
+
+    // Get the StellarNode resource
+    let api: Api<stellar_k8s::crd::StellarNode> = Api::namespaced(client, &args.namespace);
+    let node = api
+        .get(&args.node_name)
+        .await
+        .map_err(|_e| Error::NotFound {
+            kind: "StellarNode".to_string(),
+            name: args.node_name.clone(),
+            namespace: args.namespace.clone(),
+        })?;
+
+    // Generate the runbook
+    let runbook = generate_runbook(&node)?;
+
+    // Output to file or stdout
+    if let Some(output_path) = args.output {
+        std::fs::write(&output_path, &runbook).map_err(Error::IoError)?;
+        println!("Runbook generated successfully: {output_path}");
+    } else {
+        println!("{runbook}");
+    }
+
+    Ok(())
+}
+
+/// Run the StellarBenchmark controller as a standalone process.
+async fn run_benchmark_controller_cmd(args: BenchmarkArgs) -> Result<(), Error> {
+    use stellar_k8s::controller::run_benchmark_controller;
+
+    // Minimal tracing setup for the benchmark controller.
+    let env_filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(
+            args.log_level
+                .parse()
+                .unwrap_or(tracing::Level::INFO.into()),
+        )
+        .from_env_lossy();
+
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(env_filter)
+        .init();
+
+    info!(
+        "Starting StellarBenchmark controller v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let client = kube::Client::try_default()
+        .await
+        .map_err(Error::KubeError)?;
+
+    // The benchmark controller always acts as leader (it is stateless and
+    // idempotent, so multiple replicas are safe).
+    let is_leader = Arc::new(AtomicBool::new(true));
+
+    run_benchmark_controller(client, is_leader)
+        .await
+        .map_err(|e| Error::ConfigError(format!("Benchmark controller error: {e}")))?;
+
+    Ok(())
+}
+
 #[cfg(feature = "admission-webhook")]
 async fn run_webhook(args: WebhookArgs) -> Result<(), Error> {
     use stellar_k8s::webhook::{runtime::WasmRuntime, server::WebhookServer};
@@ -723,6 +877,7 @@ async fn run_webhook(args: WebhookArgs) -> Result<(), Error> {
 
     tracing_subscriber::registry()
         .with(env_filter)
+        .with(ScrubLayer::new())
         .with(fmt_layer)
         .init();
 
@@ -802,11 +957,14 @@ async fn run_operator(args: RunArgs) -> Result<(), Error> {
         .with_default_directive(Level::INFO.into())
         .from_env_lossy();
 
+    let (env_filter, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
+
     let fmt_layer = fmt::layer().json().with_target(true);
 
     // Register the subscriber with both stdout logging and OpenTelemetry tracing
     let registry = tracing_subscriber::registry()
         .with(env_filter)
+        .with(ScrubLayer::new())
         .with(fmt_layer);
 
     // Only enable OTEL if an endpoint is provided or via a flag
@@ -962,6 +1120,9 @@ async fn run_operator(args: RunArgs) -> Result<(), Error> {
         operator_config: Arc::new(operator_config),
         reconcile_id_counter: std::sync::atomic::AtomicU64::new(0),
         last_reconcile_success: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        log_reload_handle: reload_handle,
+        log_level_expires_at: Arc::new(tokio::sync::Mutex::new(None)),
+        last_event_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     // Start the peer discovery manager
@@ -1101,6 +1262,36 @@ async fn run_operator(args: RunArgs) -> Result<(), Error> {
     let shutdown_namespace = args.namespace.clone();
     let shutdown_is_leader = Arc::clone(&is_leader);
     let shutdown_identity = holder_identity.clone();
+
+    // Spawn the StellarBenchmark controller as a background task so it runs
+    // alongside the main StellarNode controller in the same process.
+    {
+        let bench_client = client.clone();
+        let bench_is_leader = Arc::clone(&is_leader);
+        tokio::spawn(async move {
+            if let Err(e) =
+                controller::run_benchmark_controller(bench_client, bench_is_leader).await
+            {
+                tracing::error!("StellarBenchmark controller error: {:?}", e);
+            }
+        });
+    }
+
+    // Spawn the auto-snapshot worker.
+    // This background task periodically creates CSI VolumeSnapshots for all
+    // Validator nodes with `spec.snapshotSchedule` configured, and tracks
+    // bootstrap status for nodes started from a snapshot.
+    {
+        let snapshot_client = client.clone();
+        let snapshot_reporter = kube::runtime::events::Reporter {
+            controller: "stellar-operator-snapshot-worker".to_string(),
+            instance: None,
+        };
+        tokio::spawn(async move {
+            controller::run_snapshot_worker(snapshot_client, snapshot_reporter).await;
+        });
+        info!("Auto-snapshot worker spawned");
+    }
 
     let result = tokio::select! {
         res = controller::run_controller(state) => {

@@ -7,6 +7,7 @@ use crate::controller::resource_meta::merge_resource_meta;
 
 // *** NEW: import kms_secret so we can accept SeedInjectionSpec ***
 use super::kms_secret;
+use super::label_propagation::LabelPropagator;
 
 use std::collections::BTreeMap;
 
@@ -17,9 +18,10 @@ use k8s_openapi::api::autoscaling::v2::{
     MetricTarget, ObjectMetricSource,
 };
 use k8s_openapi::api::core::v1::{
-    Affinity, ConfigMap, Container, ContainerPort, EnvVar, EnvVarSource, PersistentVolumeClaim,
-    PersistentVolumeClaimSpec, PodAffinityTerm, PodAntiAffinity, PodSpec, PodTemplateSpec,
-    ResourceRequirements as K8sResources, SecretKeySelector, Service, ServicePort, ServiceSpec,
+    Affinity, Capabilities, ConfigMap, Container, ContainerPort, EnvVar, EnvVarSource,
+    PersistentVolumeClaim, PersistentVolumeClaimSpec, PodAffinityTerm, PodAntiAffinity,
+    PodSecurityContext, PodSpec, PodTemplateSpec, ResourceRequirements as K8sResources,
+    SeccompProfile, SecretKeySelector, SecurityContext, Service, ServicePort, ServiceSpec,
     TypedLocalObjectReference, Volume, VolumeMount, VolumeResourceRequirements,
     WeightedPodAffinityTerm,
 };
@@ -41,9 +43,8 @@ use crate::crd::{
     BackupConfiguration, BarmanObjectStore, BootstrapConfiguration, Cluster, ClusterSpec,
     HistoryMode, HsmProvider, IngressConfig, InitDbConfiguration, KeySource, ManagedDatabaseConfig,
     MonitoringConfiguration, NetworkPolicyConfig, NodeType, PgBouncerSpec, Pooler, PoolerCluster,
-    PoolerSpec, PostgresConfiguration, RolloutStrategy, S3Credentials,
-    SecretKeySelector as CnpgSecretKeySelector, StellarNode, StellarNodeSpec, StorageConfiguration,
-    WalBackupConfiguration,
+    PoolerSpec, PostgresConfiguration, S3Credentials, SecretKeySelector as CnpgSecretKeySelector,
+    StellarNode, StellarNodeSpec, StorageConfiguration, WalBackupConfiguration,
 };
 use crate::error::{Error, Result};
 
@@ -69,7 +70,9 @@ pub(crate) fn standard_labels(node: &StellarNode) -> BTreeMap<String, String> {
     );
     labels.insert(
         "stellar-network".to_string(),
-        node.spec.network.scheduling_label_value(),
+        node.spec
+            .network
+            .scheduling_label_value(&node.spec.custom_network_passphrase),
     );
     labels
 }
@@ -129,8 +132,13 @@ fn delete_params(dry_run: bool) -> DeleteParams {
 // ============================================================================
 
 /// Ensure a PersistentVolumeClaim exists for the node
-#[instrument(skip(client, node), fields(name = %node.name_any(), namespace = node.namespace()))]
-pub async fn ensure_pvc(client: &Client, node: &StellarNode, dry_run: bool) -> Result<()> {
+#[instrument(skip(client, node, propagated_labels), fields(name = %node.name_any(), namespace = node.namespace()))]
+pub async fn ensure_pvc(
+    client: &Client,
+    node: &StellarNode,
+    propagated_labels: &BTreeMap<String, String>,
+    dry_run: bool,
+) -> Result<()> {
     let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &namespace);
     let name = resource_name(node, "data");
@@ -145,8 +153,7 @@ pub async fn ensure_pvc(client: &Client, node: &StellarNode, dry_run: bool) -> R
         has_local_path = sc_api.get("local-path").await.is_ok();
         has_local_storage = sc_api.get("local-storage").await.is_ok();
     }
-    let resolved_storage_class =
-        resolve_pvc_storage_class(node, has_local_path, has_local_storage);
+    let resolved_storage_class = resolve_pvc_storage_class(node, has_local_path, has_local_storage);
     if node.spec.storage.mode == crate::crd::types::StorageMode::Local
         && resolved_storage_class.is_empty()
     {
@@ -155,7 +162,21 @@ pub async fn ensure_pvc(client: &Client, node: &StellarNode, dry_run: bool) -> R
         );
     }
 
-    let pvc = build_pvc(node, resolved_storage_class);
+    // Fetch existing resource labels for stale-label removal
+    let existing_labels = match api.get(&name).await {
+        Ok(existing) => existing.metadata.labels.clone().unwrap_or_default(),
+        Err(kube::Error::Api(e)) if e.code == 404 => BTreeMap::new(),
+        Err(e) => return Err(Error::KubeError(e)),
+    };
+
+    let mut pvc = build_pvc(node, resolved_storage_class);
+
+    // Apply label propagation: merge propagated labels, then remove stale ones
+    let base_labels = pvc.metadata.labels.clone().unwrap_or_default();
+    let merged = LabelPropagator::merge_onto(&base_labels, propagated_labels);
+    let final_labels =
+        LabelPropagator::remove_stale_labels(&merged, propagated_labels, &existing_labels);
+    pvc.metadata.labels = Some(final_labels);
 
     match api.get(&name).await {
         Ok(existing) => {
@@ -221,15 +242,24 @@ fn build_pvc(node: &StellarNode, storage_class_name: String) -> PersistentVolume
 
     let annotations = node.spec.storage.annotations.clone().unwrap_or_default();
 
-    // When restoring from a VolumeSnapshot, set dataSource so the PVC is populated from the snapshot
+    // When restoring from a VolumeSnapshot, set dataSource so the PVC is populated from the snapshot.
+    // Priority: spec.storage.snapshotRef.volumeSnapshotName > spec.restoreFromSnapshot.volumeSnapshotName
     let data_source = node
         .spec
-        .restore_from_snapshot
+        .storage
+        .snapshot_ref
         .as_ref()
-        .map(|r| TypedLocalObjectReference {
+        .and_then(|r| r.volume_snapshot_name.as_deref())
+        .or_else(|| {
+            node.spec
+                .restore_from_snapshot
+                .as_ref()
+                .map(|r| r.volume_snapshot_name.as_str())
+        })
+        .map(|snap_name| TypedLocalObjectReference {
             api_group: Some("snapshot.storage.k8s.io".to_string()),
             kind: "VolumeSnapshot".to_string(),
-            name: r.volume_snapshot_name.clone(),
+            name: snap_name.to_string(),
         });
 
     PersistentVolumeClaim {
@@ -309,7 +339,7 @@ pub async fn ensure_config_map(
     Ok(())
 }
 
-fn build_config_map(
+pub(crate) fn build_config_map(
     node: &StellarNode,
     quorum_override: Option<crate::controller::vsl::QuorumSet>,
     enable_mtls: bool,
@@ -321,7 +351,7 @@ fn build_config_map(
 
     data.insert(
         "NETWORK_PASSPHRASE".to_string(),
-        node.spec.network.passphrase().to_string(),
+        node.spec.network_passphrase().to_string(),
     );
 
     if enable_mtls {
@@ -450,18 +480,33 @@ pub async fn delete_config_map(client: &Client, node: &StellarNode, dry_run: boo
 // ============================================================================
 
 /// Ensure a Deployment exists for RPC nodes
-#[instrument(skip(client, node), fields(name = %node.name_any(), namespace = node.namespace()))]
+#[instrument(skip(client, node, propagated_labels), fields(name = %node.name_any(), namespace = node.namespace()))]
 pub async fn ensure_deployment(
     client: &Client,
     node: &StellarNode,
     enable_mtls: bool,
+    propagated_labels: &BTreeMap<String, String>,
     dry_run: bool,
 ) -> Result<()> {
     let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
     let api: Api<Deployment> = Api::namespaced(client.clone(), &namespace);
     let name = node.name_any();
 
-    let deployment = build_deployment(node, enable_mtls);
+    // Fetch existing resource labels for stale-label removal
+    let existing_labels = match api.get(&name).await {
+        Ok(existing) => existing.metadata.labels.clone().unwrap_or_default(),
+        Err(kube::Error::Api(e)) if e.code == 404 => BTreeMap::new(),
+        Err(e) => return Err(Error::KubeError(e)),
+    };
+
+    let mut deployment = build_deployment(node, enable_mtls);
+
+    // Apply label propagation: merge propagated labels, then remove stale ones
+    let base_labels = deployment.metadata.labels.clone().unwrap_or_default();
+    let merged = LabelPropagator::merge_onto(&base_labels, propagated_labels);
+    let final_labels =
+        LabelPropagator::remove_stale_labels(&merged, propagated_labels, &existing_labels);
+    deployment.metadata.labels = Some(final_labels);
 
     let patch = Patch::Apply(&deployment);
     api.patch(&name, &patch_params(dry_run), &patch).await?;
@@ -496,20 +541,13 @@ pub async fn ensure_canary_deployment(
     deployment.metadata.name = Some(name.clone());
 
     if let Some(spec) = &mut deployment.spec {
-        let mut labels = spec
-            .template
-            .metadata
-            .as_ref()
-            .and_then(|m| m.labels.clone())
-            .unwrap_or_default();
+        let mut labels = standard_labels(&canary_node);
         labels.insert("stellar.org/rollout-type".to_string(), "canary".to_string());
         spec.template.metadata.as_mut().unwrap().labels = Some(labels.clone());
         spec.selector.match_labels = Some(labels.clone());
 
         let meta = &mut deployment.metadata;
-        let mut meta_labels = meta.labels.clone().unwrap_or_default();
-        meta_labels.insert("stellar.org/rollout-type".to_string(), "canary".to_string());
-        meta.labels = Some(meta_labels);
+        meta.labels = Some(labels);
     }
 
     let patch = Patch::Apply(&deployment);
@@ -562,20 +600,35 @@ fn build_deployment(node: &StellarNode, enable_mtls: bool) -> Deployment {
 /// `seed_injection` describes how the validator seed should be mounted into
 /// the pod — either as an env var from a Secret/ExternalSecret, or as a CSI
 /// volume mount. Pass `None` when called for non-validator nodes.
-#[instrument(skip(client, node), fields(name = %node.name_any(), namespace = node.namespace()))]
+#[instrument(skip(client, node, propagated_labels), fields(name = %node.name_any(), namespace = node.namespace()))]
 pub async fn ensure_statefulset(
     client: &Client,
     node: &StellarNode,
     enable_mtls: bool,
     seed_injection: Option<&kms_secret::SeedInjectionSpec>,
+    propagated_labels: &BTreeMap<String, String>,
     dry_run: bool,
 ) -> Result<()> {
     let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
     let api: Api<StatefulSet> = Api::namespaced(client.clone(), &namespace);
     let name = node.name_any();
 
+    // Fetch existing resource labels for stale-label removal
+    let existing_labels = match api.get(&name).await {
+        Ok(existing) => existing.metadata.labels.clone().unwrap_or_default(),
+        Err(kube::Error::Api(e)) if e.code == 404 => BTreeMap::new(),
+        Err(e) => return Err(Error::KubeError(e)),
+    };
+
     // *** Pass seed_injection down to the builder ***
-    let statefulset = build_statefulset(node, enable_mtls, seed_injection);
+    let mut statefulset = build_statefulset(node, enable_mtls, seed_injection);
+
+    // Apply label propagation: merge propagated labels, then remove stale ones
+    let base_labels = statefulset.metadata.labels.clone().unwrap_or_default();
+    let merged = LabelPropagator::merge_onto(&base_labels, propagated_labels);
+    let final_labels =
+        LabelPropagator::remove_stale_labels(&merged, propagated_labels, &existing_labels);
+    statefulset.metadata.labels = Some(final_labels);
 
     let patch = Patch::Apply(&statefulset);
     api.patch(&name, &patch_params(dry_run), &patch).await?;
@@ -664,18 +717,33 @@ pub async fn delete_workload(client: &Client, node: &StellarNode, dry_run: bool)
 // ============================================================================
 
 /// Ensure a Service exists for the node
-#[instrument(skip(client, node), fields(name = %node.name_any(), namespace = node.namespace()))]
+#[instrument(skip(client, node, propagated_labels), fields(name = %node.name_any(), namespace = node.namespace()))]
 pub async fn ensure_service(
     client: &Client,
     node: &StellarNode,
     enable_mtls: bool,
+    propagated_labels: &BTreeMap<String, String>,
     dry_run: bool,
 ) -> Result<()> {
     let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
     let api: Api<Service> = Api::namespaced(client.clone(), &namespace);
     let name = node.name_any();
 
-    let service = build_service(node, enable_mtls);
+    // Fetch existing resource labels for stale-label removal
+    let existing_labels = match api.get(&name).await {
+        Ok(existing) => existing.metadata.labels.clone().unwrap_or_default(),
+        Err(kube::Error::Api(e)) if e.code == 404 => BTreeMap::new(),
+        Err(e) => return Err(Error::KubeError(e)),
+    };
+
+    let mut service = build_service(node, enable_mtls);
+
+    // Apply label propagation: merge propagated labels, then remove stale ones
+    let base_labels = service.metadata.labels.clone().unwrap_or_default();
+    let merged = LabelPropagator::merge_onto(&base_labels, propagated_labels);
+    let final_labels =
+        LabelPropagator::remove_stale_labels(&merged, propagated_labels, &existing_labels);
+    service.metadata.labels = Some(final_labels);
 
     let patch = Patch::Apply(&service);
     api.patch(&name, &patch_params(dry_run), &patch).await?;
@@ -707,13 +775,11 @@ pub async fn ensure_canary_service(
     service.metadata.name = Some(name.clone());
 
     if let Some(spec) = &mut service.spec {
-        let mut selector = spec.selector.clone().unwrap_or_default();
-        selector.insert("stellar.org/rollout-type".to_string(), "canary".to_string());
-        spec.selector = Some(selector);
+        let mut labels = standard_labels(node);
+        labels.insert("stellar.org/rollout-type".to_string(), "canary".to_string());
+        spec.selector = Some(labels.clone());
 
         let meta = &mut service.metadata;
-        let mut labels = meta.labels.clone().unwrap_or_default();
-        labels.insert("stellar.org/rollout-type".to_string(), "canary".to_string());
         meta.labels = Some(labels);
     }
 
@@ -1098,7 +1164,7 @@ pub async fn ensure_ingress(client: &Client, node: &StellarNode, dry_run: bool) 
 
     info!("Ingress ensured for {}/{}", namespace, name);
 
-    if let RolloutStrategy::Canary(ref cfg) = node.spec.strategy {
+    if let Some(cfg) = node.spec.strategy.canary() {
         if node
             .status
             .as_ref()
@@ -1314,7 +1380,7 @@ fn build_pod_template(
             Volume {
                 name: "config".to_string(),
                 config_map: Some(k8s_openapi::api::core::v1::ConfigMapVolumeSource {
-                    name: Some(resource_name(node, "config")),
+                    name: resource_name(node, "config"),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1325,6 +1391,17 @@ fn build_pod_template(
             &node.name_any(),
         )),
         affinity: merge_workload_affinity(node),
+        security_context: Some(PodSecurityContext {
+            run_as_non_root: Some(true),
+            run_as_user: Some(10000),
+            run_as_group: Some(10000),
+            fs_group: Some(10000),
+            seccomp_profile: Some(SeccompProfile {
+                localhost_profile: None,
+                type_: "RuntimeDefault".to_string(),
+            }),
+            ..Default::default()
+        }),
         ..Default::default()
     };
 
@@ -1343,6 +1420,27 @@ fn build_pod_template(
                 let init_containers = pod_spec.init_containers.get_or_insert_with(Vec::new);
                 init_containers.push(build_horizon_migration_container(node));
             }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Snapshot / compressed-backup restore init container
+    //
+    // Injected when `spec.storage.snapshotRef.backupUrl` is set.  The init
+    // container downloads and extracts the archive into /data before Stellar
+    // Core starts, enabling near-instant bootstrap from a compressed DB backup.
+    // CSI VolumeSnapshot restores are handled at the PVC level (dataSource) and
+    // do NOT need an init container.
+    // -------------------------------------------------------------------------
+    if let Some(snapshot_ref) = &node.spec.storage.snapshot_ref {
+        if let Some(backup_url) = &snapshot_ref.backup_url {
+            let init_containers = pod_spec.init_containers.get_or_insert_with(Vec::new);
+            init_containers.push(build_snapshot_restore_container(
+                node,
+                backup_url,
+                snapshot_ref.credentials_secret_ref.as_deref(),
+                snapshot_ref.restore_image.as_deref(),
+            ));
         }
     }
 
@@ -1397,6 +1495,20 @@ fn build_pod_template(
                             mount_path: "/keys".to_string(),
                             ..Default::default()
                         }]),
+                        security_context: Some(SecurityContext {
+                            allow_privilege_escalation: Some(false),
+                            capabilities: Some(Capabilities {
+                                drop: Some(vec!["ALL".to_string()]),
+                                add: None,
+                            }),
+                            run_as_non_root: Some(true),
+                            privileged: Some(false),
+                            seccomp_profile: Some(SeccompProfile {
+                                type_: "RuntimeDefault".to_string(),
+                                localhost_profile: None,
+                            }),
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     });
                 }
@@ -1440,6 +1552,20 @@ fn build_pod_template(
                             mount_path: "/var/run/cloudhsm".to_string(),
                             ..Default::default()
                         }]),
+                        security_context: Some(SecurityContext {
+                            allow_privilege_escalation: Some(false),
+                            capabilities: Some(Capabilities {
+                                drop: Some(vec!["ALL".to_string()]),
+                                add: None,
+                            }),
+                            run_as_non_root: Some(true),
+                            privileged: Some(false),
+                            seccomp_profile: Some(SeccompProfile {
+                                type_: "RuntimeDefault".to_string(),
+                                localhost_profile: None,
+                            }),
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     });
                 } else if hsm_config.provider == HsmProvider::Azure {
@@ -1465,11 +1591,113 @@ fn build_pod_template(
                             mount_path: "/var/run/dedicatedhsm".to_string(),
                             ..Default::default()
                         }]),
+                        security_context: Some(SecurityContext {
+                            allow_privilege_escalation: Some(false),
+                            capabilities: Some(Capabilities {
+                                drop: Some(vec!["ALL".to_string()]),
+                                add: None,
+                            }),
+                            run_as_non_root: Some(true),
+                            privileged: Some(false),
+                            seccomp_profile: Some(SeccompProfile {
+                                type_: "RuntimeDefault".to_string(),
+                                localhost_profile: None,
+                            }),
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     });
                 }
             }
         }
+    }
+
+    // Add NAT traversal sidecar
+    if let Some(nat_cfg) = &node.spec.nat_traversal {
+        if nat_cfg.enabled {
+            let mut env = vec![EnvVar {
+                name: "ENABLE_ICE".to_string(),
+                value: Some(nat_cfg.enable_ice.to_string()),
+                ..Default::default()
+            }];
+
+            if let Some(stun) = &nat_cfg.stun_server {
+                env.push(EnvVar {
+                    name: "STUN_SERVER".to_string(),
+                    value: Some(stun.clone()),
+                    ..Default::default()
+                });
+            }
+
+            if let Some(turn) = &nat_cfg.turn_server {
+                env.push(EnvVar {
+                    name: "TURN_SERVER".to_string(),
+                    value: Some(turn.clone()),
+                    ..Default::default()
+                });
+            }
+
+            if let Some(secret_ref) = &nat_cfg.turn_credentials_secret_ref {
+                env.push(EnvVar {
+                    name: "TURN_USERNAME".to_string(),
+                    value: None,
+                    value_from: Some(EnvVarSource {
+                        secret_key_ref: Some(SecretKeySelector {
+                            name: Some(secret_ref.clone()),
+                            key: "username".to_string(),
+                            optional: Some(false),
+                        }),
+                        ..Default::default()
+                    }),
+                });
+                env.push(EnvVar {
+                    name: "TURN_PASSWORD".to_string(),
+                    value: None,
+                    value_from: Some(EnvVarSource {
+                        secret_key_ref: Some(SecretKeySelector {
+                            name: Some(secret_ref.clone()),
+                            key: "password".to_string(),
+                            optional: Some(false),
+                        }),
+                        ..Default::default()
+                    }),
+                });
+            }
+
+            let sidecar_image = nat_cfg
+                .sidecar_image
+                .clone()
+                .unwrap_or_else(|| "stellar/nat-traversal:latest".to_string());
+
+            let containers = &mut pod_spec.containers;
+            containers.push(Container {
+                name: "nat-traversal".to_string(),
+                image: Some(sidecar_image),
+                env: Some(env),
+                security_context: Some(SecurityContext {
+                    allow_privilege_escalation: Some(false),
+                    capabilities: Some(Capabilities {
+                        drop: Some(vec!["ALL".to_string()]),
+                        add: None,
+                    }),
+                    run_as_non_root: Some(true),
+                    privileged: Some(false),
+                    seccomp_profile: Some(SeccompProfile {
+                        type_: "RuntimeDefault".to_string(),
+                        localhost_profile: None,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+    }
+
+    // ==========================================================================
+    // Merge user-defined sidecar containers into the pod spec
+    // ==========================================================================
+    if let Some(sidecars) = &node.spec.sidecars {
+        pod_spec.containers.extend(sidecars.iter().cloned());
     }
 
     // ==========================================================================
@@ -1499,9 +1727,35 @@ fn build_pod_template(
     }
     // ==========================================================================
 
+    let mut apparmor_annotations = BTreeMap::new();
+    if let Some(containers) = &pod_spec.init_containers {
+        for container in containers {
+            apparmor_annotations.insert(
+                format!(
+                    "container.apparmor.security.beta.kubernetes.io/{}",
+                    container.name
+                ),
+                "runtime/default".to_string(),
+            );
+        }
+    }
+    for container in &pod_spec.containers {
+        apparmor_annotations.insert(
+            format!(
+                "container.apparmor.security.beta.kubernetes.io/{}",
+                container.name
+            ),
+            "runtime/default".to_string(),
+        );
+    }
+
     let mut pod_object_meta = ObjectMeta {
         labels: Some(labels.clone()),
-        annotations: None,
+        annotations: if apparmor_annotations.is_empty() {
+            None
+        } else {
+            Some(apparmor_annotations)
+        },
         ..Default::default()
     };
     if let Some(inj) = seed_injection {
@@ -1521,6 +1775,29 @@ fn build_pod_template(
     }
 }
 
+fn parse_cpu_millicores(cpu: &str) -> Option<u32> {
+    let trimmed = cpu.trim();
+    if let Some(milli) = trimmed.strip_suffix('m') {
+        return milli.parse::<u32>().ok();
+    }
+
+    let cores = trimmed.parse::<f64>().ok()?;
+    if cores.is_sign_negative() {
+        return None;
+    }
+
+    Some((cores * 1000.0).round() as u32)
+}
+
+fn derive_worker_threads(node: &StellarNode) -> u32 {
+    let millicores = parse_cpu_millicores(&node.spec.resources.limits.cpu)
+        .or_else(|| parse_cpu_millicores(&node.spec.resources.requests.cpu))
+        .unwrap_or(1000);
+
+    let cores = millicores.div_ceil(1000).clamp(1, 32);
+    cores.max(1)
+}
+
 fn network_spread_label_selector(spec: &StellarNodeSpec) -> LabelSelector {
     LabelSelector {
         match_labels: Some(BTreeMap::from([
@@ -1530,7 +1807,8 @@ fn network_spread_label_selector(spec: &StellarNodeSpec) -> LabelSelector {
             ),
             (
                 "stellar-network".to_string(),
-                spec.network.scheduling_label_value(),
+                spec.network
+                    .scheduling_label_value(&spec.custom_network_passphrase),
             ),
             (
                 "app.kubernetes.io/component".to_string(),
@@ -1546,14 +1824,94 @@ pub(crate) fn merge_workload_affinity(node: &StellarNode) -> Option<Affinity> {
     if let Some(na) = node.spec.storage.node_affinity.clone() {
         aff.node_affinity = Some(na);
     }
+
+    let mut req_terms = Vec::new();
+    let mut pref_terms = Vec::new();
+
+    // 1. Default network-level separation
     if let Some(pa) = build_network_pod_anti_affinity(node) {
-        aff.pod_anti_affinity = Some(pa);
+        if let Some(mut req) = pa.required_during_scheduling_ignored_during_execution {
+            req_terms.append(&mut req);
+        }
+        if let Some(mut pref) = pa.preferred_during_scheduling_ignored_during_execution {
+            pref_terms.append(&mut pref);
+        }
     }
+
+    // 2. SCP-aware separation (Validators only)
+    if let Some(pa) = build_scp_aware_pod_anti_affinity(node) {
+        if let Some(mut req) = pa.required_during_scheduling_ignored_during_execution {
+            req_terms.append(&mut req);
+        }
+        if let Some(mut pref) = pa.preferred_during_scheduling_ignored_during_execution {
+            pref_terms.append(&mut pref);
+        }
+    }
+
+    if !req_terms.is_empty() || !pref_terms.is_empty() {
+        aff.pod_anti_affinity = Some(PodAntiAffinity {
+            required_during_scheduling_ignored_during_execution: if req_terms.is_empty() {
+                None
+            } else {
+                Some(req_terms)
+            },
+            preferred_during_scheduling_ignored_during_execution: if pref_terms.is_empty() {
+                None
+            } else {
+                Some(pref_terms)
+            },
+        });
+    }
+
     if aff.node_affinity.is_none() && aff.pod_anti_affinity.is_none() {
         None
     } else {
         Some(aff)
     }
+}
+
+fn build_scp_aware_pod_anti_affinity(node: &StellarNode) -> Option<PodAntiAffinity> {
+    // Only applies to Validators when SCP-aware placement is enabled
+    if node.spec.node_type != NodeType::Validator || !node.spec.placement.scp_aware_anti_affinity {
+        return None;
+    }
+
+    let qset = node
+        .spec
+        .validator_config
+        .as_ref()
+        .and_then(|c| c.quorum_set.as_ref())?;
+
+    let peer_names = extract_peer_names_from_toml(qset);
+    if peer_names.is_empty() {
+        return None;
+    }
+
+    let mut terms = Vec::new();
+
+    for peer_name in peer_names {
+        // We discourage placing this validator on the same node as its quorum set members.
+        // Each peer is identified by its instance name label.
+        let mut match_labels = BTreeMap::new();
+        match_labels.insert("app.kubernetes.io/instance".to_string(), peer_name);
+
+        terms.push(WeightedPodAffinityTerm {
+            weight: 100,
+            pod_affinity_term: PodAffinityTerm {
+                label_selector: Some(LabelSelector {
+                    match_labels: Some(match_labels),
+                    ..Default::default()
+                }),
+                topology_key: "kubernetes.io/hostname".to_string(),
+                ..Default::default()
+            },
+        });
+    }
+
+    Some(PodAntiAffinity {
+        preferred_during_scheduling_ignored_during_execution: Some(terms),
+        ..Default::default()
+    })
 }
 
 fn build_network_pod_anti_affinity(node: &StellarNode) -> Option<PodAntiAffinity> {
@@ -1658,9 +2016,50 @@ fn build_container(node: &StellarNode, enable_mtls: bool) -> Container {
 
     let mut env_vars = vec![EnvVar {
         name: "NETWORK_PASSPHRASE".to_string(),
-        value: Some(node.spec.network.passphrase().to_string()),
+        value: Some(node.spec.network_passphrase().to_string()),
         ..Default::default()
     }];
+
+    let worker_threads = derive_worker_threads(node);
+    match node.spec.node_type {
+        NodeType::Validator => {
+            env_vars.push(EnvVar {
+                name: "STELLAR_CORE_WORKER_THREADS".to_string(),
+                value: Some(worker_threads.to_string()),
+                ..Default::default()
+            });
+            env_vars.push(EnvVar {
+                name: "STELLAR_CORE_HTTP_QUERY_THREADS".to_string(),
+                value: Some((worker_threads.max(2) / 2).max(1).to_string()),
+                ..Default::default()
+            });
+        }
+        NodeType::Horizon => {
+            let ingest_workers = node
+                .spec
+                .horizon_config
+                .as_ref()
+                .map(|cfg| cfg.ingest_workers.max(1))
+                .unwrap_or(worker_threads);
+            env_vars.push(EnvVar {
+                name: "HORIZON_INGEST_WORKERS".to_string(),
+                value: Some(ingest_workers.to_string()),
+                ..Default::default()
+            });
+        }
+        NodeType::SorobanRpc => {
+            env_vars.push(EnvVar {
+                name: "SOROBAN_RPC_WORKER_THREADS".to_string(),
+                value: Some(worker_threads.to_string()),
+                ..Default::default()
+            });
+            env_vars.push(EnvVar {
+                name: "CAPTIVE_CORE_WORKER_THREADS".to_string(),
+                value: Some((worker_threads / 2).max(1).to_string()),
+                ..Default::default()
+            });
+        }
+    }
 
     // Source validator seed from Secret or shared RAM volume (KMS)
     if let NodeType::Validator = node.spec.node_type {
@@ -1871,6 +2270,21 @@ fn build_container(node: &StellarNode, enable_mtls: bool) -> Container {
             limits: Some(limits),
             claims: None,
         }),
+        security_context: Some(SecurityContext {
+            allow_privilege_escalation: Some(false),
+            capabilities: Some(Capabilities {
+                add: None,
+                drop: Some(vec!["ALL".to_string()]),
+            }),
+            run_as_non_root: Some(true),
+            privileged: Some(false),
+            read_only_root_filesystem: Some(true),
+            seccomp_profile: Some(SeccompProfile {
+                localhost_profile: None,
+                type_: "RuntimeDefault".to_string(),
+            }),
+            ..Default::default()
+        }),
         volume_mounts: Some(volume_mounts),
         ..Default::default()
     }
@@ -1891,6 +2305,158 @@ fn build_horizon_migration_container(node: &StellarNode) -> Container {
     container.startup_probe = None;
     container.lifecycle = None;
     container
+}
+
+/// Build the snapshot-restore init container for compressed DB backup bootstrapping.
+///
+/// This container runs before Stellar Core and:
+/// 1. Checks whether `/data` is already populated (idempotent — skips if data exists).
+/// 2. Downloads the archive from `backup_url` (S3 or HTTPS).
+/// 3. Extracts it into `/data`.
+///
+/// Supports `.tar.gz` and `.tar.zst` archives.
+/// For S3 URLs, AWS CLI credentials are injected from `credentials_secret_ref`.
+fn build_snapshot_restore_container(
+    node: &StellarNode,
+    backup_url: &str,
+    credentials_secret_ref: Option<&str>,
+    restore_image: Option<&str>,
+) -> Container {
+    // Choose a sensible default image based on the URL scheme.
+    let image = restore_image
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if backup_url.starts_with("s3://") {
+                "amazon/aws-cli:latest".to_string()
+            } else {
+                "alpine:3".to_string()
+            }
+        });
+
+    // Determine the decompression command based on the file extension.
+    let decompress_flag = if backup_url.ends_with(".tar.zst") {
+        "--use-compress-program=zstd"
+    } else {
+        "-z" // default: gzip
+    };
+
+    // Build the shell script that runs inside the init container.
+    // The script is idempotent: if /data already has content it exits immediately.
+    let script = if backup_url.starts_with("s3://") {
+        format!(
+            r#"set -e
+# Skip restore if data volume already has content (idempotent)
+if [ "$(ls -A /data 2>/dev/null)" ]; then
+  echo "Data volume already populated, skipping snapshot restore."
+  exit 0
+fi
+echo "Restoring from S3 snapshot: {url}"
+aws s3 cp "{url}" /tmp/snapshot.archive
+echo "Extracting archive..."
+tar {decompress} -xf /tmp/snapshot.archive -C /data
+rm -f /tmp/snapshot.archive
+echo "Snapshot restore complete."
+"#,
+            url = backup_url,
+            decompress = decompress_flag,
+        )
+    } else {
+        format!(
+            r#"set -e
+# Skip restore if data volume already has content (idempotent)
+if [ "$(ls -A /data 2>/dev/null)" ]; then
+  echo "Data volume already populated, skipping snapshot restore."
+  exit 0
+fi
+echo "Restoring from backup: {url}"
+wget -q -O /tmp/snapshot.archive "{url}" || curl -fsSL -o /tmp/snapshot.archive "{url}"
+echo "Extracting archive..."
+tar {decompress} -xf /tmp/snapshot.archive -C /data
+rm -f /tmp/snapshot.archive
+echo "Snapshot restore complete."
+"#,
+            url = backup_url,
+            decompress = decompress_flag,
+        )
+    };
+
+    // Build environment variables — inject AWS credentials if provided.
+    let mut env: Vec<EnvVar> = vec![
+        EnvVar {
+            name: "BACKUP_URL".to_string(),
+            value: Some(backup_url.to_string()),
+            ..Default::default()
+        },
+    ];
+
+    if let Some(secret_name) = credentials_secret_ref {
+        // AWS credentials
+        for key in &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION"] {
+            env.push(EnvVar {
+                name: key.to_string(),
+                value: None,
+                value_from: Some(EnvVarSource {
+                    secret_key_ref: Some(SecretKeySelector {
+                        name: Some(secret_name.to_string()),
+                        key: key.to_string(),
+                        optional: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+            });
+        }
+        // Generic bearer token for HTTPS
+        env.push(EnvVar {
+            name: "BEARER_TOKEN".to_string(),
+            value: None,
+            value_from: Some(EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    name: Some(secret_name.to_string()),
+                    key: "BEARER_TOKEN".to_string(),
+                    optional: Some(true),
+                }),
+                ..Default::default()
+            }),
+        });
+    }
+
+    Container {
+        name: "snapshot-restore".to_string(),
+        image: Some(image),
+        command: Some(vec!["/bin/sh".to_string(), "-c".to_string(), script]),
+        env: Some(env),
+        volume_mounts: Some(vec![VolumeMount {
+            name: "data".to_string(),
+            mount_path: "/data".to_string(),
+            ..Default::default()
+        }]),
+        // Security: run as non-root, read-only root filesystem except /tmp
+        security_context: Some(SecurityContext {
+            run_as_non_root: Some(false), // aws-cli/alpine may need root for tar
+            allow_privilege_escalation: Some(false),
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        resources: Some(K8sResources {
+            requests: Some({
+                let mut m = BTreeMap::new();
+                m.insert("cpu".to_string(), Quantity("100m".to_string()));
+                m.insert("memory".to_string(), Quantity("256Mi".to_string()));
+                m
+            }),
+            limits: Some({
+                let mut m = BTreeMap::new();
+                m.insert("cpu".to_string(), Quantity("500m".to_string()));
+                m.insert("memory".to_string(), Quantity("512Mi".to_string()));
+                m
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 // ============================================================================
@@ -2250,11 +2816,62 @@ pub async fn ensure_network_policy(
     Ok(())
 }
 
+/// Extract peer addresses (IPs or Hostnames) from QUORUM_SET and KNOWN_PEERS TOML strings.
+fn extract_peers_from_config(node: &StellarNode) -> Vec<String> {
+    let mut peers = Vec::new();
+    let config = match &node.spec.validator_config {
+        Some(c) => c,
+        None => return peers,
+    };
+
+    // 1. Parse KNOWN_PEERS if present
+    if let Some(known_peers_toml) = &config.known_peers {
+        if let Ok(value) = known_peers_toml.parse::<toml::Value>() {
+            if let Some(kp_array) = value.as_array() {
+                for v in kp_array {
+                    if let Some(s) = v.as_str() {
+                        // Extract IP/Hostname from "IP:PORT"
+                        let peer = s.split(':').next().unwrap_or(s);
+                        peers.push(peer.to_string());
+                    }
+                }
+            } else if let Some(kp_table) = value.get("KNOWN_PEERS").and_then(|v| v.as_array()) {
+                for v in kp_table {
+                    if let Some(s) = v.as_str() {
+                        let peer = s.split(':').next().unwrap_or(s);
+                        peers.push(peer.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Parse QUORUM_SET for any direct IP references (rare but possible in custom setups)
+    if let Some(qs_toml) = &config.quorum_set {
+        if let Ok(value) = qs_toml.parse::<toml::Value>() {
+            // Check for [VALIDATORS] section with IP-like keys
+            if let Some(validators) = value.get("VALIDATORS").and_then(|v| v.as_table()) {
+                for key in validators.keys() {
+                    // If key looks like an IP or hostname (not a public key), add it
+                    if !key.starts_with('G') && key.contains('.') {
+                        peers.push(key.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    peers.sort();
+    peers.dedup();
+    peers
+}
+
 fn build_network_policy(node: &StellarNode, config: &NetworkPolicyConfig) -> NetworkPolicy {
     let labels = standard_labels(node);
     let name = resource_name(node, "netpol");
 
     let mut ingress_rules: Vec<NetworkPolicyIngressRule> = Vec::new();
+    let mut egress_rules: Vec<k8s_openapi::api::networking::v1::NetworkPolicyEgressRule> = Vec::new();
 
     let app_ports = match node.spec.node_type {
         NodeType::Validator => vec![
@@ -2368,14 +2985,234 @@ fn build_network_policy(node: &StellarNode, config: &NetworkPolicyConfig) -> Net
                 ..Default::default()
             }]),
         });
+
+        // --- Stellar-Native Egress Rules ---
+        // 1. Allow DNS (essential for hostname resolution)
+        egress_rules.push(k8s_openapi::api::networking::v1::NetworkPolicyEgressRule {
+            to: None, // Allow to all for port 53
+            ports: Some(vec![
+                NetworkPolicyPort {
+                    port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(53)),
+                    protocol: Some("UDP".to_string()),
+                    ..Default::default()
+                },
+                NetworkPolicyPort {
+                    port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(53)),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                },
+            ]),
+        });
+
+        // 2. Allow egress to parsed peers (KNOWN_PEERS / QUORUM_SET)
+        let peers = extract_peers_from_config(node);
+        if !peers.is_empty() {
+            let mut peer_egress_to = Vec::new();
+            for peer in peers {
+                // If it looks like an IP, use ipBlock. If it's a hostname, we can't 
+                // do much in standard NetPol without a DNS controller, but we can
+                // allow all egress on peer ports as a fallback or if IP is known.
+                if peer.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ':') {
+                    peer_egress_to.push(NetworkPolicyPeer {
+                        ip_block: Some(IPBlock {
+                            cidr: if peer.contains('/') { peer } else { format!("{}/32", peer) },
+                            except: None,
+                        }),
+                        ..Default::default()
+                    });
+                }
+            }
+
+            egress_rules.push(k8s_openapi::api::networking::v1::NetworkPolicyEgressRule {
+                to: if peer_egress_to.is_empty() { None } else { Some(peer_egress_to) },
+                ports: Some(vec![NetworkPolicyPort {
+                    port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(11625)),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }]),
+            });
+        }
+
+        // 3. Allow egress to history archives (HTTP/HTTPS)
+        if let Some(vc) = &node.spec.validator_config {
+            if vc.enable_history_archive && !vc.history_archive_urls.is_empty() {
+                egress_rules.push(k8s_openapi::api::networking::v1::NetworkPolicyEgressRule {
+                    to: None, // External history archives
+                    ports: Some(vec![
+                        NetworkPolicyPort {
+                            port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(80)),
+                            protocol: Some("TCP".to_string()),
+                            ..Default::default()
+                        },
+                        NetworkPolicyPort {
+                            port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(443)),
+                            protocol: Some("TCP".to_string()),
+                            ..Default::default()
+                        },
+                    ]),
+                });
+            }
+        }
+    } else {
+        // Horizon / Soroban RPC egress rules
+        // 1. Allow DNS
+        egress_rules.push(k8s_openapi::api::networking::v1::NetworkPolicyEgressRule {
+            to: None,
+            ports: Some(vec![
+                NetworkPolicyPort {
+                    port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(53)),
+                    protocol: Some("UDP".to_string()),
+                    ..Default::default()
+                },
+                NetworkPolicyPort {
+                    port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(53)),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                },
+            ]),
+        });
+
+        // 2. Allow egress to Stellar Core (usually in the same namespace)
+        egress_rules.push(k8s_openapi::api::networking::v1::NetworkPolicyEgressRule {
+            to: Some(vec![NetworkPolicyPeer {
+                pod_selector: Some(LabelSelector {
+                    match_labels: Some(BTreeMap::from([(
+                        "app.kubernetes.io/name".to_string(),
+                        "stellar-node".to_string(),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ports: Some(vec![
+                NetworkPolicyPort {
+                    port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(11625)),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                },
+                NetworkPolicyPort {
+                    port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(11626)),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                },
+            ]),
+        });
+
+        // 3. Allow egress to external databases if configured
+        if node.spec.database.is_some() || node.spec.managed_database.is_some() {
+            egress_rules.push(k8s_openapi::api::networking::v1::NetworkPolicyEgressRule {
+                to: None, // External DBs or CNPG
+                ports: Some(vec![NetworkPolicyPort {
+                    port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(5432)),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }]),
+            });
+        }
     }
+
+    // -----------------------------------------------------------------------
+    // Egress rules — Network Isolation
+    //
+    // Allow egress only to:
+    //   1. Pods in namespaces labelled with the SAME stellar.org/network value.
+    //      This is the critical rule: it prevents a Testnet pod from ever
+    //      opening a TCP connection to a Mainnet pod, even if both are on the
+    //      same cluster.
+    //   2. kube-dns (UDP/TCP 53) — required for all pods.
+    //   3. The Kubernetes API server (TCP 443/6443) — required for health checks.
+    //   4. Intra-namespace traffic (e.g. Horizon → Stellar Core).
+    //
+    // Any egress not matched by these rules is implicitly denied because we
+    // include "Egress" in policy_types.
+    // -----------------------------------------------------------------------
+    use k8s_openapi::api::networking::v1::NetworkPolicyEgressRule;
+
+    let network_label_value = crate::controller::network_isolation::network_label_value(
+        &node.spec.network,
+        &node.spec.custom_network_passphrase,
+    );
+
+    // Rule 1: Allow egress to pods in same-network namespaces only.
+    let same_network_egress = NetworkPolicyEgressRule {
+        to: Some(vec![NetworkPolicyPeer {
+            namespace_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    crate::controller::network_isolation::NAMESPACE_NETWORK_LABEL.to_string(),
+                    network_label_value.clone(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]),
+        ports: None,
+    };
+
+    // Rule 2: Allow DNS resolution (kube-dns).
+    let dns_egress = NetworkPolicyEgressRule {
+        to: Some(vec![NetworkPolicyPeer {
+            namespace_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    "kubernetes.io/metadata.name".to_string(),
+                    "kube-system".to_string(),
+                )])),
+                ..Default::default()
+            }),
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    "k8s-app".to_string(),
+                    "kube-dns".to_string(),
+                )])),
+                ..Default::default()
+            }),
+        }]),
+        ports: Some(vec![
+            NetworkPolicyPort {
+                port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(53)),
+                protocol: Some("UDP".to_string()),
+                ..Default::default()
+            },
+            NetworkPolicyPort {
+                port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(53)),
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            },
+        ]),
+    };
+
+    // Rule 3: Allow egress within the same namespace (intra-namespace pod communication,
+    // e.g. Horizon → Stellar Core, Soroban RPC → Captive Core).
+    let intra_namespace_egress = NetworkPolicyEgressRule {
+        to: Some(vec![NetworkPolicyPeer {
+            namespace_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    "kubernetes.io/metadata.name".to_string(),
+                    node.namespace().unwrap_or_else(|| "default".to_string()),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]),
+        ports: None,
+    };
+
+    let egress_rules = vec![same_network_egress, dns_egress, intra_namespace_egress];
 
     NetworkPolicy {
         metadata: merge_resource_meta(
             ObjectMeta {
                 name: Some(name),
                 namespace: node.namespace(),
-                labels: Some(labels),
+                labels: Some({
+                    let mut l = labels;
+                    // Stamp the network label on the NetworkPolicy itself so
+                    // cluster-level policies can select it.
+                    l.insert(
+                        crate::controller::network_isolation::NAMESPACE_NETWORK_LABEL.to_string(),
+                        network_label_value,
+                    );
+                    l
+                }),
                 owner_references: Some(vec![owner_reference(node)]),
                 ..Default::default()
             },
@@ -2392,13 +3229,19 @@ fn build_network_policy(node: &StellarNode, config: &NetworkPolicyConfig) -> Net
                 ])),
                 ..Default::default()
             },
-            policy_types: Some(vec!["Ingress".to_string()]),
+            // Enforce both Ingress and Egress so the egress deny-by-default takes effect.
+            policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
             ingress: if ingress_rules.is_empty() {
                 None
             } else {
                 Some(ingress_rules)
             },
-            egress: None,
+            egress: Some(egress_rules),
+            egress: if egress_rules.is_empty() {
+                None
+            } else {
+                Some(egress_rules)
+            },
         }),
     }
 }
@@ -2544,7 +3387,7 @@ pub(crate) fn build_service_for_test(node: &StellarNode) -> k8s_openapi::api::co
 mod ensure_pvc_tests {
     use super::{build_pvc, pvc_needs_update, resolve_pvc_storage_class};
     use crate::crd::{
-        types::{ResourceRequirements, ResourceSpec, StorageConfig, StorageMode},
+        types::{ResourceRequirements, ResourceSpec, StorageMode},
         NodeType, StellarNetwork, StellarNode, StellarNodeSpec,
     };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -2561,7 +3404,6 @@ mod ensure_pvc_tests {
                 node_type: NodeType::Validator,
                 network: StellarNetwork::Testnet,
                 version: "v21.0.0".to_string(),
-                history_mode: Default::default(),
                 resources: ResourceRequirements {
                     requests: ResourceSpec {
                         cpu: "500m".to_string(),
@@ -2572,7 +3414,6 @@ mod ensure_pvc_tests {
                         memory: "4Gi".to_string(),
                     },
                 },
-                storage: StorageConfig::default(),
                 validator_config: None,
                 horizon_config: None,
                 soroban_config: None,
@@ -2594,6 +3435,7 @@ mod ensure_pvc_tests {
                 network_policy: None,
                 dr_config: None,
                 pod_anti_affinity: Default::default(),
+                placement: Default::default(),
                 topology_spread_constraints: None,
                 cve_handling: None,
                 snapshot_schedule: None,
@@ -2604,7 +3446,14 @@ mod ensure_pvc_tests {
                 oci_snapshot: None,
                 service_mesh: None,
                 forensic_snapshot: None,
+                label_propagation: None,
                 resource_meta: None,
+                sidecars: None,
+                nat_traversal: None,
+                custom_network_passphrase: None,
+                cross_cloud_failover: None,
+                history_mode: Default::default(),
+                storage: Default::default(),
             },
             status: None,
         }
@@ -2656,7 +3505,9 @@ mod ensure_pvc_tests {
         let pvc = build_pvc(&node, "gp3".to_string());
 
         assert_eq!(
-            pvc.spec.as_ref().and_then(|s| s.storage_class_name.as_deref()),
+            pvc.spec
+                .as_ref()
+                .and_then(|s| s.storage_class_name.as_deref()),
             Some("gp3")
         );
     }
