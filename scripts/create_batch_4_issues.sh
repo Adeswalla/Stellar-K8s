@@ -23,6 +23,7 @@ To ensure the operator handles fragile network conditions gracefully, we need to
 ### 📚 Resources
 - [Chaos Mesh Documentation](https://chaos-mesh.org/docs/simulate-network-chaos-on-kubernetes/)
 - [Stellar Core Recovery Logic](https://developers.stellar.org/docs/run-core-node/prerequisites)
+- [\`tests/chaos/\`](https://github.com/OtowoOrg/Stellar-K8s/tree/main/tests/chaos)
 " --label "stellar-wave,reliability,architecture"
 
 # 30. Dynamic Peer Discovery (High - 200 pts)
@@ -38,8 +39,9 @@ Currently, peers are defined statically. We need a controller that dynamically d
 - Trigger a rolling update or signal the Stellar process to refresh configuration.
 
 ### 📚 Resources
-- [Stellar Core Peers Config](https://github.com/stellar/stellar-core/blob/master/docs/stellar-core_example.cfg)
+- [Stellar Core Peers Config](https://github.com/OtowoOrg/Stellar-K8s/blob/main/docs/stellar-core_example.cfg)
 - [kube-rs Runtime Watcher](https://kube.rs/controllers/watcher/)
+- [\`src/controller/peer_discovery.rs\`](https://github.com/OtowoOrg/Stellar-K8s/blob/main/src/controller/peer_discovery.rs)
 " --label "stellar-wave,architecture,logic"
 
 # 31. Multi-Cluster Support (High - 200 pts)
@@ -57,6 +59,7 @@ Large Stellar deployments should span multiple Kubernetes clusters. This task in
 ### 📚 Resources
 - [Submariner Multi-cluster Networking](https://submariner.io/)
 - [Stellar Network Topologies](https://developers.stellar.org/docs/run-core-node/network-topologies)
+- [\`src/main.rs\`](https://github.com/OtowoOrg/Stellar-K8s/blob/main/src/main.rs)
 " --label "stellar-wave,architecture,kubernetes"
 
 # 32. Auto-Remediation for Stale Ledgers (High - 200 pts)
@@ -73,6 +76,7 @@ If a node gets stuck or significantly behind the network, it may need an automat
 
 ### 📚 Resources
 - [Monitoring Stellar Core](https://developers.stellar.org/docs/run-core-node/monitoring)
+- [\`src/controller/reconciler.rs\`](https://github.com/OtowoOrg/Stellar-K8s/blob/main/src/controller/reconciler.rs)
 " --label "stellar-wave,reliability,logic"
 
 # 33. Cloud KMS/HSM Integration (High - 200 pts)
@@ -90,6 +94,7 @@ Storing node keys in plain Kubernetes Secrets is not sufficient for high-securit
 ### 📚 Resources
 - [AWS KMS for Kubernetes](https://aws.amazon.com/premiumsupport/knowledge-center/eks-kms-secrets-encryption/)
 - [Stellar Node Security](https://developers.stellar.org/docs/run-core-node/security-best-practices)
+- [\`src/controller/resources.rs\`](https://github.com/OtowoOrg/Stellar-K8s/blob/main/src/controller/resources.rs)
 " --label "stellar-wave,security,architecture"
 
 # 34. OpenTelemetry Tracing (High - 200 pts)
@@ -107,6 +112,7 @@ Debugging complex operator logic requires distributed tracing. Implement OpenTel
 ### 📚 Resources
 - [OpenTelemetry Rust](https://github.com/open-telemetry/opentelemetry-rust)
 - [Distributed Tracing in K8s](https://kubernetes.io/docs/concepts/cluster-administration/system-logs/#distributed-tracing)
+- [\`src/telemetry.rs\`](https://github.com/OtowoOrg/Stellar-K8s/blob/main/src/telemetry.rs)
 " --label "stellar-wave,observability,rust"
 
 # --- MEDIUM (150 pts) ---
@@ -125,6 +131,7 @@ Secure the traffic between Stellar nodes and the Operator REST API using mutual 
 
 ### 📚 Resources
 - [mTLS Explained](https://www.cloudflare.com/learning/access-management/what-is-mutual-tls/)
+- [\`src/rest_api/\`](https://github.com/OtowoOrg/Stellar-K8s/tree/main/src/rest_api)
 " --label "stellar-wave,security,feature"
 
 # 36. Canary Rollouts with Traffic Weighting (Medium - 150 pts)
@@ -141,6 +148,7 @@ When upgrading Horizon or Soroban RPC, we should support canary deployments wher
 
 ### 📚 Resources
 - [Canary Deployments on Kubernetes](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#canary-deployment)
+- [\`src/controller/reconciler.rs\`](https://github.com/OtowoOrg/Stellar-K8s/blob/main/src/controller/reconciler.rs)
 " --label "stellar-wave,kubernetes,feature"
 
 # --- TRIVIAL (100 pts) ---
@@ -159,6 +167,7 @@ Provide users with a way to check the operator version, build date, and basic cl
 
 ### 📚 Resources
 - [Clap (Rust) Documentation](https://docs.rs/clap/latest/clap/)
+- [\`src/main.rs\`](https://github.com/OtowoOrg/Stellar-K8s/blob/main/src/main.rs)
 " --label "stellar-wave,good-first-issue,rust"
 
 # 38. Improved CRD Validation Formatting (Trivial - 100 pts)
@@ -175,6 +184,7 @@ Current validation errors are raw strings. Improve the formatting in Kubernetes 
 
 ### 📚 Resources
 - [Rust Anyhow/Thiserror](https://github.com/dtolnay/anyhow)
+- [\`src/error.rs\`](https://github.com/OtowoOrg/Stellar-K8s/blob/main/src/error.rs)
 " --label "stellar-wave,good-first-issue,logic"
 
 echo "Done! Batch 4 issues created (#29-#38)."

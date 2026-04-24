@@ -19,7 +19,7 @@ The \`StellarNodeSpec::validate()\` function currently checks for missing config
 
 ### 📚 Resources
 - [Rust Testing Guide](https://doc.rust-lang.org/book/ch11-01-writing-tests.html)
-- [Stellar-K8s CRD Definition](https://github.com/stellar/stellar-k8s/blob/main/src/crd/stellar_node.rs)
+- [Stellar-K8s CRD Definition](https://github.com/OtowoOrg/Stellar-K8s/blob/main/src/crd/stellar_node.rs)
 "
 
 # Issue 3: Ready Replicas Status (Trivial - 100 Points)
